@@ -1,0 +1,7 @@
+{
+  "name": "app-running",
+  "private": true,
+  "description": "Front mobile par coureur au-dessus d'intervals.icu, avec l'avis du coach par Claude Code",
+  "engines": { "node": ">=22" },
+  "scripts": { "start": "node server.js", "test": "node test.js" }
+}

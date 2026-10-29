@@ -1,0 +1,12 @@
+[
+  {
+    "id": "fiouf",
+    "name": "Fiouf",
+    "email": "fiouf@exemple.fr",
+    "password": "<sortie de: node server.js hash 'mot de passe'>",
+    "athleteId": "i769106",
+    "apiKey": "<clé API intervals.icu du coureur>",
+    "dir": "/mnt/pool/claude/running-fiouf",
+    "objectif": "Marathon · avril 2027"
+  }
+]
