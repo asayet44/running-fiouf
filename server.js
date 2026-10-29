@@ -98,6 +98,50 @@ function parseAnalysis(stdout) {
   return { note, resume: str(a.resume), bien: str(a.bien), ameliorer: str(a.ameliorer), prochaine: str(a.prochaine) };
 }
 
+// ---------- paramètres et zones ----------
+
+const PARAM_KEYS = ['fcMax', 'fcSeuil', 'fcRepos', 'allureSeuil', 'vo2max', 'zones'];
+const ZONE_NAMES = ['Récupération', 'Endurance facile', 'Tempo', 'Seuil', 'VO2max', 'Anaérobie', 'Sprint'];
+
+// Valeur saisie à la main si présente, sinon celle d'intervals.icu.
+const mergeParams = (auto, manual = {}) => Object.fromEntries(PARAM_KEYS.map((k) => [k, manual[k] ?? auto[k] ?? null]));
+
+// "4:55" (min/km) -> m/s
+function parsePace(s) {
+  const m = /^(\d{1,2}):([0-5]\d)$/.exec(String(s).trim());
+  return m ? 1000 / (Number(m[1]) * 60 + Number(m[2])) : null;
+}
+
+// Bornes FC de la zone n (1..7) à partir des plafonds de zones intervals.icu.
+function zoneRange(zones, n) {
+  if (!zones || !zones[n - 1]) return '';
+  return n === 1 ? `moins de ${zones[0]} bpm` : `${zones[n - 2] + 1} – ${zones[n - 1]} bpm`;
+}
+
+const secs = (s) => (s < 60 ? `${s} s` : s < 3600 ? `${Math.round(s / 60)} min` : duration(s));
+
+// Étapes d'une séance prévue (workout_doc intervals.icu) -> lignes lisibles.
+function stepLines(steps, zones, depth = 0) {
+  return (steps || []).flatMap((s) => {
+    const label = String(s.text || '').split('\n')[0].trim();
+    if (s.reps) return [{ depth, text: `${s.reps} fois${label ? ` : ${label}` : ''}` }, ...stepLines(s.steps, zones, depth + 1)];
+    const amount = s.distance ? `${km(s.distance)} km` : s.duration ? secs(s.duration) : '';
+    let zone = null; let target = '';
+    if (s.hr?.units === 'hr_zone') { zone = s.hr.value; target = `${ZONE_NAMES[zone - 1] || `Zone ${zone}`} · ${zoneRange(zones, zone)}`; }
+    else if (s.pace?.units === 'pace_zone') { zone = s.pace.value; target = `Allure zone ${zone}`; }
+    return [{ depth, zone, text: [amount, target, label].filter(Boolean).join(' · ') }];
+  });
+}
+
+// Ajoute un relevé daté à l'historique s'il a changé (un seul par jour).
+function nextHistory(history, params, day) {
+  const entry = { date: day, ...Object.fromEntries(PARAM_KEYS.filter((k) => k !== 'zones').map((k) => [k, params[k]])) };
+  const last = history[history.length - 1];
+  const same = last && PARAM_KEYS.every((k) => k === 'zones' || last[k] === entry[k]);
+  if (same) return history;
+  return last?.date === day ? [...history.slice(0, -1), entry] : [...history, entry];
+}
+
 // ---------- formats ----------
 
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -152,9 +196,46 @@ function readAnalysis(user, actId) {
 function recentAnalyses(user, n = 3) {
   const dir = path.join(DATA_DIR, user.id);
   if (!fs.existsSync(dir)) return [];
-  return fs.readdirSync(dir).filter((f) => f.endsWith('.json'))
+  return fs.readdirSync(dir).filter((f) => f.endsWith('.json') && f !== HISTORY_FILE)
     .map((f) => JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')))
     .sort((a, b) => b.date.localeCompare(a.date)).slice(0, n);
+}
+
+const HISTORY_FILE = 'parametres.json';
+const historyFile = (user) => path.join(DATA_DIR, user.id, HISTORY_FILE);
+const readHistory = (user) => { try { return JSON.parse(fs.readFileSync(historyFile(user), 'utf8')); } catch { return []; } };
+
+// Paramètres relevés par intervals.icu : dernière sortie course (zones, seuil, FC max) et wellness (FC repos, VO2max).
+async function autoParams(user) {
+  const from = new Date(); from.setDate(from.getDate() - 60);
+  const q = `oldest=${isoDay(from)}&newest=${isoDay(new Date())}`;
+  const [acts, wellness] = await Promise.all([
+    icu(user, `/athlete/${user.athleteId}/activities?${q}`),
+    icu(user, `/athlete/${user.athleteId}/wellness?${q}`),
+  ]);
+  const run = acts.filter((a) => /Run/.test(a.type)).sort((a, b) => b.start_date_local.localeCompare(a.start_date_local))[0] || {};
+  const w = [...wellness].sort((a, b) => String(b.id).localeCompare(String(a.id)));
+  const last = (k) => w.find((x) => x[k] != null)?.[k] ?? null;
+  return {
+    fcMax: run.athlete_max_hr ?? null, fcSeuil: run.lthr ?? null, fcRepos: last('restingHR') ?? run.icu_resting_hr ?? null,
+    allureSeuil: run.threshold_pace ?? null, vo2max: last('vo2max'), zones: run.icu_hr_zones ?? null,
+  };
+}
+
+async function currentParams(user) {
+  const auto = await autoParams(user).catch(() => ({}));
+  const params = mergeParams(auto, user.params);
+  const history = nextHistory(readHistory(user), params, isoDay(new Date()));
+  fs.mkdirSync(path.join(DATA_DIR, user.id), { recursive: true });
+  fs.writeFileSync(historyFile(user), JSON.stringify(history, null, 2));
+  return { params, auto, history };
+}
+
+function updateUser(id, patch) {
+  const users = loadUsers();
+  const u = users.find((x) => x.id === id);
+  Object.assign(u, patch);
+  saveUsers(users);
 }
 
 const contextFile = (user) => path.join(user.dir, 'CONTEXTE.md');
@@ -165,7 +246,10 @@ const running = new Set();
 async function analyse(user, act, planned) {
   const today = isoDay(new Date());
   const in7 = new Date(); in7.setDate(in7.getDate() + 7);
-  const upcoming = await icu(user, `/athlete/${user.athleteId}/events?oldest=${today}&newest=${isoDay(in7)}&category=WORKOUT`);
+  const [upcoming, { params }] = await Promise.all([
+    icu(user, `/athlete/${user.athleteId}/events?oldest=${today}&newest=${isoDay(in7)}&category=WORKOUT`),
+    currentParams(user),
+  ]);
   const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
   const prompt = [
     `Tu es le coach running de ${user.name}, qui prépare ${user.objectif || 'un marathon'}.`,
@@ -181,6 +265,8 @@ async function analyse(user, act, planned) {
     planned ? JSON.stringify(pick(planned, ['name', 'description', 'moving_time', 'distance'])) : 'Aucune (sortie libre).',
     '## Prochaines séances prévues',
     JSON.stringify(upcoming.map((e) => pick(e, ['start_date_local', 'name', 'description']))),
+    '## Paramètres du coureur (FC en bpm, allure seuil en m/s, zones = plafonds FC Z1..Z7)',
+    JSON.stringify(params),
     '## Contexte donné par le coureur',
     readContext(user) || '(vide)',
     '## Tes derniers avis',
@@ -217,7 +303,10 @@ h1{margin:0;font-size:30px;font-weight:800;letter-spacing:-.5px}h2{margin:4px 0 
 .effort{display:flex;height:14px;border-radius:7px;overflow:hidden;gap:2px}.k{font-size:13px;font-weight:800}
 .btn{min-height:50px;border:0;border-radius:14px;background:#C2410C;color:#fff;font:700 16px Manrope,system-ui,sans-serif;padding:0 20px;cursor:pointer}
 .btn.ghost{background:transparent;border:1px solid #DAD6CE;color:#55585F}input,textarea{width:100%;border:1px solid #DAD6CE;border-radius:14px;padding:14px;font:16px Manrope,system-ui,sans-serif;background:#fff}
-label{font-size:14px;font-weight:600}nav{position:fixed;bottom:0;left:0;right:0;display:grid;grid-template-columns:repeat(5,1fr);background:#fff;border-top:1px solid #E7E4DE;padding:6px 4px 18px}
+label{font-size:14px;font-weight:600}.link{background:none;border:0;padding:12px 0;min-height:44px;color:#C8C9CC;font:600 12px Manrope,system-ui,sans-serif;text-decoration:underline;cursor:pointer;white-space:nowrap}
+.step{display:flex;gap:10px;align-items:center;font-size:15px}.dot{width:12px;height:12px;border-radius:6px;flex:none}
+table{border-collapse:collapse;width:100%;font-size:13px}td,th{padding:6px 4px;text-align:left;border-top:1px solid #ECE9E3}th{color:#55585F;font-weight:600}
+.pf{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.pf label{display:flex;flex-direction:column;gap:4px}.pf span{font-size:12px;color:#55585F;font-weight:400}nav{position:fixed;bottom:0;left:0;right:0;display:grid;grid-template-columns:repeat(5,1fr);background:#fff;border-top:1px solid #E7E4DE;padding:6px 4px 18px}
 nav a,nav span{min-height:50px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;font-size:11px;color:#55585F}
 nav span{opacity:.5}nav a[aria-current]{color:#C2410C;font-weight:700}.err{background:#FDE2E2;color:#8A1C1C;border-radius:14px;padding:12px 14px}`;
 
@@ -322,8 +411,8 @@ async function weekPage(user) {
   const cardHtml = cards.map(({ day, ev, act }) => {
     const title = esc(cleanTitle(ev ? ev.name : act.name));
     if (!act) {
-      return `<div class="card todo"><div class="row"><span class="muted">${dayLabel(day)}</span><span class="chip">${day < today ? 'Manquée' : 'À venir'}</span></div>
-<span class="title">${title}</span><span class="muted">${esc(planSummary(ev.description))}</span></div>`;
+      return `<a class="card todo" href="/prevu/${encodeURIComponent(ev.id)}"><div class="row"><span class="muted">${dayLabel(day)}</span><span class="chip">${day < today ? 'Manquée' : 'À venir'}</span></div>
+<span class="title">${title}</span><span class="muted">${esc(planSummary(ev.description))}</span></a>`;
     }
     const a = readAnalysis(user, act.id);
     return `<a class="card" href="/seance/${encodeURIComponent(act.id)}"><div class="row"><span class="muted">${dayLabel(day)}</span>
@@ -335,8 +424,8 @@ ${ev ? `<span class="muted">${esc(planSummary(ev.description))}</span>` : ''}
   const pct = plannedKm ? Math.min(100, Math.round((100 * doneKm) / plannedKm)) : 0;
   return page('Ma semaine', `<div><p class="muted">Semaine du ${dayLabel(isoDay(monday), { day: 'numeric', month: 'short' })} au ${dayLabel(isoDay(sunday), { day: 'numeric', month: 'short' })}</p>
 <h1>Salut ${esc(user.name)}</h1></div>
-<div class="today"><b>AUJOURD'HUI</b><span class="title">${todayCard ? esc(cleanTitle(todayCard.ev.name)) : 'Repos'}</span>
-${todayCard ? `<p class="muted">${esc(planSummary(todayCard.ev.description))}</p>` : ''}</div>
+<${todayCard ? `a href="/prevu/${encodeURIComponent(todayCard.ev.id)}"` : 'div'} class="today" style="display:block"><b>AUJOURD'HUI</b><span class="title">${todayCard ? esc(cleanTitle(todayCard.ev.name)) : 'Repos'}</span>
+${todayCard ? `<p class="muted">${esc(planSummary(todayCard.ev.description))}</p>` : ''}</${todayCard ? 'a' : 'div'}>
 <h2>Mes séances</h2>${cardHtml || '<p class="muted">Aucune séance prévue cette semaine.</p>'}
 <section class="dark" aria-label="Bilan de la semaine"><h2 style="margin:0">Ma semaine</h2>
 <div class="row"><span class="big">${km(doneKm)} km</span>${plannedKm ? `<span class="muted">sur ${km(plannedKm)} km prévus</span>` : ''}</div>
@@ -359,7 +448,9 @@ async function sessionPage(user, actId, error) {
 <div><span class="k" style="color:#7FD3A0">CE QUI VA BIEN</span><p>${esc(a.bien)}</p></div>
 <div><span class="k" style="color:#F6B07F">À AMÉLIORER</span><p>${esc(a.ameliorer)}</p></div>
 <div><span class="k" style="color:#9FC1FF">POUR LA PROCHAINE</span><p>${esc(a.prochaine)}</p></div>
-<span class="muted" style="font-size:12px">Analysé par Claude avec ton profil · ${new Date(a.date).toLocaleDateString('fr-FR')}</span></section>`
+<form method="post" action="/seance/${encodeURIComponent(act.id)}/analyse" class="row">
+<span class="muted" style="font-size:12px">Analysé par Claude avec ton profil · ${new Date(a.date).toLocaleDateString('fr-FR')}</span>
+<button type="submit" class="link">Refaire l'analyse</button></form></section>`
     : `<form method="post" action="/seance/${encodeURIComponent(act.id)}/analyse" class="dark"><h2 style="margin:0">L'avis du coach</h2>
 <p class="muted">Claude compare ta séance au plan, avec ton profil et ses derniers avis. Ça prend environ une minute.</p>
 <button class="btn" type="submit">Demander l'avis du coach</button></form>`;
@@ -384,16 +475,79 @@ ${(act.interval_summary || []).map((s) => `<span class="muted">${esc(s)}</span>`
 <span class="muted">Dénivelé + ${Math.round(act.total_elevation_gain || 0)} m · cadence ${Math.round((act.average_cadence || 0) * 2)} pas/min</span></details>`, 'semaine');
 }
 
-function profilePage(user, saved) {
+async function plannedPage(user, eventId) {
+  const ev = await icu(user, `/athlete/${user.athleteId}/events/${encodeURIComponent(eventId)}`).catch(() => null);
+  if (!ev || ev.category !== 'WORKOUT') return null;
+  const { params } = await currentParams(user);
+  const lines = stepLines(ev.workout_doc?.steps, params.zones);
+  const color = (z) => (!z ? '#C8C9CC' : z <= 2 ? '#5AA87A' : z === 3 ? '#F28A4B' : '#B4232C');
+  const day = ev.start_date_local.slice(0, 10);
+  return page(cleanTitle(ev.name), `<a href="/semaine" class="muted" style="min-height:44px;display:flex;align-items:center">‹ Ma semaine</a>
+<div style="display:flex;flex-direction:column;gap:6px"><span class="muted">${dayLabel(day, { weekday: 'long', day: 'numeric', month: 'short' })}</span>
+<h1>${esc(cleanTitle(ev.name))}</h1><span class="chip" style="align-self:flex-start">${day < isoDay(new Date()) ? 'Manquée' : 'À venir'}</span></div>
+<p>${esc(planSummary(ev.description))}</p>
+<section class="card grid2" aria-label="En bref" style="display:grid">
+<div><div class="v">${ev.moving_time ? duration(ev.moving_time) : '–'}</div><span class="muted">durée prévue</span></div>
+<div><div class="v">${ev.distance ? `${km(ev.distance)} km` : '–'}</div><span class="muted">distance prévue</span></div></section>
+${lines.length ? `<section class="card" aria-label="Déroulé"><h2 style="margin:0;font-size:16px">Le déroulé</h2>
+${lines.map((l) => `<div class="step" style="padding-left:${l.depth * 22}px"><span class="dot" aria-hidden="true" style="background:${color(l.zone)}"></span><span>${esc(l.text)}</span></div>`).join('')}</section>` : ''}
+${params.zones ? `<section class="card" aria-label="Mes zones"><h2 style="margin:0;font-size:16px">Mes zones cardio</h2><table>
+${ZONE_NAMES.map((n, i) => (params.zones[i] ? `<tr><td><span class="dot" aria-hidden="true" style="display:inline-block;background:${color(i + 1)}"></span> ${n}</td><td>${zoneRange(params.zones, i + 1)}</td></tr>` : '')).join('')}</table></section>` : ''}`, 'semaine');
+}
+
+const fmtParam = (k, v) => (v == null ? '' : k === 'allureSeuil' ? pace(v) : k === 'zones' ? v.join(', ') : String(v));
+const PARAM_FIELDS = [
+  ['fcMax', 'FC max', 'bpm'], ['fcSeuil', 'FC au seuil', 'bpm'], ['fcRepos', 'FC de repos', 'bpm'],
+  ['allureSeuil', 'Allure seuil', 'min/km'], ['vo2max', 'VO2max', ''], ['zones', 'Zones FC (plafonds Z1 à Z7)', 'bpm'],
+];
+
+// Saisie manuelle -> surcharges validées ; champ vide = valeur d'intervals.icu.
+function parseParams(f) {
+  const out = {};
+  for (const [k, label] of PARAM_FIELDS) {
+    const raw = String(f.get(k) || '').trim();
+    if (!raw) continue;
+    let v;
+    if (k === 'allureSeuil') v = parsePace(raw);
+    else if (k === 'zones') {
+      v = raw.split(/[,;\s]+/).map(Number);
+      if (v.length > 7 || v.some((n, i) => !Number.isInteger(n) || n < 30 || n > 250 || (i && n <= v[i - 1]))) v = null;
+    } else {
+      v = Number(raw.replace(',', '.'));
+      const [min, max] = k === 'vo2max' ? [10, 100] : [30, 250];
+      if (!(v >= min && v <= max)) v = null;
+    }
+    if (v == null) return { error: `${label} : valeur invalide.` };
+    out[k] = v;
+  }
+  return { params: out };
+}
+
+async function profilePage(user, msg, error) {
+  const { params, auto, history } = await currentParams(user);
+  const manual = user.params || {};
   return page('Profil', `<div style="display:flex;align-items:center;gap:14px">
 <span aria-hidden="true" style="width:56px;height:56px;border-radius:28px;background:#C2410C;color:#fff;font-size:24px;font-weight:800;display:flex;align-items:center;justify-content:center">${esc(user.name.charAt(0))}</span>
 <div><h1 style="font-size:26px">${esc(user.name)}</h1><span class="muted">Connecté à intervals.icu</span></div></div>
+${msg ? `<p role="status" style="color:#1D7A46;font-weight:600">${esc(msg)}</p>` : ''}${error ? `<p class="err" role="alert">${esc(error)}</p>` : ''}
 <section class="card"><span class="k muted">MON OBJECTIF</span><span class="title">${esc(user.objectif || 'Marathon · avril 2027')}</span></section>
-<form method="post" action="/profil" class="card"><label for="ctx" style="font-size:16px;font-weight:800">Ce que mon coach doit savoir sur moi</label>
+<form method="post" action="/profil" class="card"><label for="name">Mon prénom</label>
+<input id="name" name="name" required maxlength="40" value="${esc(user.name)}">
+<label for="ctx" style="font-size:16px;font-weight:800;margin-top:6px">Ce que mon coach doit savoir sur moi</label>
 <p class="muted">Claude relit ce texte avant chaque analyse, avec tes dernières séances et ses anciens avis.</p>
 <textarea id="ctx" name="contexte" rows="8" maxlength="20000" placeholder="Blessures, contraintes, disponibilités, ce qui te motive…">${esc(readContext(user))}</textarea>
-${saved ? '<p role="status" style="color:#1D7A46;font-weight:600">Enregistré.</p>' : ''}
 <button class="btn" type="submit" style="align-self:flex-start">Enregistrer</button></form>
+<form method="post" action="/profil/parametres" class="card"><h2 style="margin:0;font-size:16px">Mes paramètres</h2>
+<p class="muted">Remplis automatiquement depuis intervals.icu. Écris une valeur pour la corriger, vide le champ pour revenir à celle d'intervals.icu.</p>
+<div class="pf">${PARAM_FIELDS.map(([k, label, unit]) => `<label${k === 'zones' ? ' style="grid-column:1/-1"' : ''}>${label}${unit ? ` (${unit})` : ''}
+<input name="${k}" inputmode="${k === 'zones' || k === 'allureSeuil' ? 'text' : 'decimal'}" value="${esc(fmtParam(k, manual[k]))}" placeholder="${esc(fmtParam(k, auto[k]) || '–')}">
+<span>${manual[k] != null ? 'corrigé à la main' : 'intervals.icu'}</span></label>`).join('')}</div>
+<button class="btn" type="submit" style="align-self:flex-start">Enregistrer mes paramètres</button></form>
+${history.length ? `<section class="card" aria-label="Historique"><h2 style="margin:0;font-size:16px">Ma progression</h2>
+<div style="overflow-x:auto"><table><tr><th>Date</th><th>FC repos</th><th>FC seuil</th><th>Allure seuil</th><th>VO2max</th></tr>
+${[...history].reverse().slice(0, 12).map((h) => `<tr><td>${new Date(`${h.date}T12:00:00`).toLocaleDateString('fr-FR', { day: 'numeric', month: 'short' })}</td>
+<td>${h.fcRepos ?? '–'}</td><td>${h.fcSeuil ?? '–'}</td><td>${h.allureSeuil ? pace(h.allureSeuil) : '–'}</td><td>${h.vo2max ?? '–'}</td></tr>`).join('')}
+</table></div></section>` : ''}
 <form method="post" action="/logout"><button class="btn ghost" type="submit" style="width:100%">Se déconnecter</button></form>`, 'profil');
 }
 
@@ -441,11 +595,24 @@ async function handle(req, res) {
 
   if (p === '/logout' && req.method === 'POST') return redirect(res, '/login', { 'Set-Cookie': 'session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0' });
   if (p === '/' || p === '/semaine') return send(res, 200, await weekPage(user));
-  if (p === '/profil' && req.method === 'GET') return send(res, 200, profilePage(user, url.searchParams.has('ok')));
+  if (p === '/profil' && req.method === 'GET') return send(res, 200, await profilePage(user, url.searchParams.has('ok') ? 'Enregistré.' : ''));
   if (p === '/profil' && req.method === 'POST') {
     const f = await readForm(req);
+    const name = String(f.get('name') || '').trim().slice(0, 40);
+    if (name) updateUser(user.id, { name });
     fs.writeFileSync(contextFile(user), String(f.get('contexte') || '').slice(0, 20_000));
     return redirect(res, '/profil?ok');
+  }
+  if (p === '/profil/parametres' && req.method === 'POST') {
+    const { params, error } = parseParams(await readForm(req));
+    if (error) return send(res, 400, await profilePage(user, '', error));
+    updateUser(user.id, { params });
+    return redirect(res, '/profil?ok');
+  }
+  const pm = /^\/prevu\/(\d+)$/.exec(p);
+  if (pm && req.method === 'GET') {
+    const html = await plannedPage(user, pm[1]);
+    return html ? send(res, 200, html) : send(res, 404, page('Introuvable', '<h1>Séance introuvable</h1>', 'semaine'));
   }
 
   const m = /^\/seance\/([\w-]+)(\/analyse)?$/.exec(p);
@@ -489,4 +656,4 @@ if (require.main === module) {
   })).listen(PORT, () => console.log(`App running sur http://localhost:${PORT}`));
 }
 
-module.exports = { hashPassword, checkPassword, sign, unsign, weekBounds, cleanTitle, planSummary, effortSplit, matchWeek, parseAnalysis, isoDay };
+module.exports = { mergeParams, parsePace, zoneRange, stepLines, nextHistory, parseParams, hashPassword, checkPassword, sign, unsign, weekBounds, cleanTitle, planSummary, effortSplit, matchWeek, parseAnalysis, isoDay };

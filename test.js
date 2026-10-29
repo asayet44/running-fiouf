@@ -37,3 +37,37 @@ assert.throws(() => s.parseAnalysis(JSON.stringify({ result: '{"note": 12}' })))
 assert.throws(() => s.parseAnalysis(JSON.stringify({ result: 'pas de json' })));
 
 console.log('ok');
+
+// v2 : paramètres, zones, séances prévues, historique
+assert.deepStrictEqual(s.mergeParams({ fcMax: 191, fcRepos: 126 }, { fcRepos: 52 }),
+  { fcMax: 191, fcSeuil: null, fcRepos: 52, allureSeuil: null, vo2max: null, zones: null });
+assert.strictEqual(Math.round(1000 / s.parsePace('4:55')), 295);
+assert.strictEqual(s.parsePace('4:75'), null);
+const zones = [148, 157, 165, 174, 179, 184, 191];
+assert.strictEqual(s.zoneRange(zones, 1), 'moins de 148 bpm');
+assert.strictEqual(s.zoneRange(zones, 2), '149 – 157 bpm');
+const lines = s.stepLines([
+  { hr: { units: 'hr_zone', value: 2 }, distance: 4000, duration: 1429 },
+  { reps: 6, text: 'Lignes droites\n6x', steps: [{ hr: { units: 'hr_zone', value: 5 }, duration: 20 }, { hr: { units: 'hr_zone', value: 1 }, duration: 40 }] },
+], zones);
+assert.deepStrictEqual(lines.map((l) => [l.depth, l.zone ?? null, l.text]), [
+  [0, 2, '4,0 km · Endurance facile · 149 – 157 bpm'],
+  [0, null, '6 fois : Lignes droites'],
+  [1, 5, '20 s · VO2max · 175 – 179 bpm'],
+  [1, 1, '40 s · Récupération · moins de 148 bpm'],
+]);
+const p1 = { fcMax: 191, fcSeuil: 175, fcRepos: 52, allureSeuil: 3.4, vo2max: 46, zones };
+let h = s.nextHistory([], p1, '2026-10-29');
+assert.strictEqual(h.length, 1);
+assert.strictEqual(s.nextHistory(h, p1, '2026-10-30'), h); // inchangé -> pas de nouvelle ligne
+h = s.nextHistory(h, { ...p1, vo2max: 47 }, '2026-10-29');
+assert.deepStrictEqual([h.length, h[0].vo2max], [1, 47]); // même jour -> remplacé
+h = s.nextHistory(h, { ...p1, vo2max: 48 }, '2026-11-05');
+assert.deepStrictEqual(h.map((e) => e.vo2max), [47, 48]);
+const form = (o) => new URLSearchParams(o);
+assert.deepStrictEqual(s.parseParams(form({ fcRepos: '52', allureSeuil: '4:55', zones: '148, 157, 165', vo2max: '' })).params,
+  { fcRepos: 52, allureSeuil: 1000 / 295, zones: [148, 157, 165] });
+assert.ok(s.parseParams(form({ zones: '157, 148' })).error);
+assert.ok(s.parseParams(form({ fcMax: '400' })).error);
+
+console.log('ok v2');
