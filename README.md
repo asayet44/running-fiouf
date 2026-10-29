@@ -5,8 +5,12 @@ Une petite app web mobile, une par coureur, au-dessus d'intervals.icu :
 - **Création de compte dans l'app** : e-mail, mot de passe et clé API intervals.icu (vérifiée), au premier passage.
 - **Connexion** : chaque coureur ne voit que ses données.
 - **Ma semaine** : une carte par séance prévue ou faite, et le bilan en bas (km, durée, score, séances faites).
-- **Détail d'une séance** : prévu vs réalisé, part facile / soutenu / dur, et **l'avis du coach** généré par Claude Code.
-- **Profil** : objectif et « Ce que mon coach doit savoir sur moi ».
+- **Détail d'une séance faite** : prévu vs réalisé, part facile / soutenu / dur, et **l'avis du coach** généré par Claude Code (avec « Refaire l'analyse »).
+- **Détail d'une séance à venir** : le déroulé étape par étape avec les zones visées en bpm.
+- **Profil** : prénom, « Ce que mon coach doit savoir sur moi », et **Mes paramètres** (FC max, seuil, repos, allure seuil, VO2max, zones)
+  remplis depuis intervals.icu, corrigeables à la main, avec l'historique de leur évolution.
+
+Les données sont relues en direct sur intervals.icu à chaque ouverture de page.
 
 Pas de dépendance ni de build : un seul fichier `server.js` (Node 22+).
 
