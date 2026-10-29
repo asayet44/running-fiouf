@@ -12,6 +12,8 @@ const USERS_FILE = process.env.USERS_FILE || path.join(__dirname, 'users.json');
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const SECRET = process.env.SESSION_SECRET || '';
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
+const RUNNERS_DIR = process.env.RUNNERS_DIR || path.join(__dirname, 'runners'); // dossiers des projets coach
+const SIGNUP_CODE = process.env.SIGNUP_CODE || ''; // vide = création de compte libre
 
 // ---------- utilitaires purs (testés dans test.js) ----------
 
@@ -116,7 +118,22 @@ const dayLabel = (iso, opts = { weekday: 'long', day: 'numeric' }) => {
 
 // ---------- données ----------
 
-const loadUsers = () => JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
+function loadUsers() {
+  try { return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch (err) { if (err.code === 'ENOENT') return []; throw err; }
+}
+
+function saveUsers(users) {
+  fs.mkdirSync(path.dirname(USERS_FILE), { recursive: true });
+  const tmp = `${USERS_FILE}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(users, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, USERS_FILE);
+}
+
+function projectChoices() {
+  try {
+    return fs.readdirSync(RUNNERS_DIR, { withFileTypes: true }).filter((d) => d.isDirectory() && !d.name.startsWith('.')).map((d) => d.name);
+  } catch { return []; }
+}
 
 async function icu(user, p) {
   const res = await fetch(`https://intervals.icu/api/v1${p}`, {
@@ -231,7 +248,55 @@ ${error ? `<p class="err" role="alert">${esc(error)}</p>` : ''}
 <form method="post" action="/login" style="display:flex;flex-direction:column;gap:14px">
 <label for="email">E-mail</label><input id="email" name="email" type="email" autocomplete="email" required>
 <label for="pwd">Mot de passe</label><input id="pwd" name="password" type="password" autocomplete="current-password" required>
-<button class="btn" type="submit">Se connecter</button></form>`);
+<button class="btn" type="submit">Se connecter</button></form>
+<a href="/inscription" class="btn ghost" style="display:flex;align-items:center;justify-content:center">Première fois ? Créer mon compte</a>`);
+}
+
+function signupPage(error, v = new URLSearchParams()) {
+  const projects = projectChoices();
+  return page('Créer mon compte', `<div style="display:flex;flex-direction:column;gap:8px"><h1>Créer mon compte</h1>
+<p class="muted">Une seule fois : ensuite tu te connectes avec ton e-mail et ton mot de passe.</p></div>
+${error ? `<p class="err" role="alert">${esc(error)}</p>` : ''}
+<form method="post" action="/inscription" style="display:flex;flex-direction:column;gap:14px">
+<label for="email">E-mail</label><input id="email" name="email" type="email" autocomplete="email" required value="${esc(v.get('email'))}">
+<label for="pwd">Mot de passe (8 caractères minimum)</label><input id="pwd" name="password" type="password" autocomplete="new-password" minlength="8" required>
+<label for="key">Clé API intervals.icu</label><input id="key" name="apiKey" autocomplete="off" required value="${esc(v.get('apiKey'))}">
+<p class="muted">Sur intervals.icu : Settings, tout en bas « Developer Settings », puis « API Key ». Copie-la ici.</p>
+<label for="obj">Mon objectif</label><input id="obj" name="objectif" value="${esc(v.get('objectif') ?? 'Marathon · avril 2027')}">
+${projects.length ? `<label for="proj">Mon projet coach</label><select id="proj" name="projet" style="height:52px;border:1px solid #DAD6CE;border-radius:14px;padding:0 12px;font:16px Manrope,system-ui,sans-serif;background:#fff">
+<option value="">Aucun</option>${projects.map((p) => `<option${v.get('projet') === p ? ' selected' : ''}>${esc(p)}</option>`).join('')}</select>
+<p class="muted">Le dossier où Claude garde tes notes de coureur.</p>` : ''}
+${SIGNUP_CODE ? `<label for="code">Code d'invitation</label><input id="code" name="code" autocomplete="off" required>` : ''}
+<button class="btn" type="submit">Créer mon compte</button></form>
+<a href="/login" class="muted" style="text-align:center;min-height:44px">J'ai déjà un compte</a>`);
+}
+
+// Vérifie la clé auprès d'intervals.icu (athlète 0 = celui de la clé) et crée le compte.
+async function signup(f) {
+  const email = String(f.get('email') || '').trim().toLowerCase();
+  const password = String(f.get('password') || '');
+  const apiKey = String(f.get('apiKey') || '').trim();
+  const projet = String(f.get('projet') || '');
+  if (SIGNUP_CODE && f.get('code') !== SIGNUP_CODE) return { error: "Code d'invitation incorrect." };
+  if (!/^\S+@\S+\.\S+$/.test(email)) return { error: 'E-mail invalide.' };
+  if (password.length < 8) return { error: 'Mot de passe trop court (8 caractères minimum).' };
+  if (projet && !projectChoices().includes(projet)) return { error: 'Projet inconnu.' };
+  const users = loadUsers();
+  if (users.some((u) => u.email === email)) return { error: 'Un compte existe déjà avec cet e-mail.' };
+
+  let athlete;
+  try { athlete = await icu({ apiKey }, '/athlete/0'); } catch { return { error: "intervals.icu refuse cette clé API. Vérifie-la et réessaie." }; }
+  if (users.some((u) => u.athleteId === athlete.id)) return { error: 'Ce compte intervals.icu a déjà un compte dans l\'app.' };
+
+  const id = String(athlete.id).replace(/[^\w-]/g, '');
+  const dir = projet ? path.join(RUNNERS_DIR, projet) : path.join(DATA_DIR, 'runners', id);
+  fs.mkdirSync(dir, { recursive: true });
+  const user = {
+    id, name: String(athlete.firstname || athlete.name || email.split('@')[0]).trim(), email,
+    password: hashPassword(password), athleteId: athlete.id, apiKey, dir, objectif: String(f.get('objectif') || '').slice(0, 200),
+  };
+  saveUsers([...users, user]);
+  return { user };
 }
 
 async function weekPage(user) {
@@ -356,12 +421,19 @@ async function handle(req, res) {
   const p = url.pathname;
 
   if (p === '/login' && req.method === 'GET') return send(res, 200, loginPage());
+  const secure = req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
+  const loggedIn = (user) => redirect(res, '/semaine', { 'Set-Cookie': `session=${encodeURIComponent(sign(user.id))}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000${secure}` });
   if (p === '/login' && req.method === 'POST') {
     const f = await readForm(req);
     const user = loadUsers().find((u) => u.email.toLowerCase() === String(f.get('email')).trim().toLowerCase());
     if (!user || !checkPassword(String(f.get('password')), user.password)) return send(res, 401, loginPage('E-mail ou mot de passe incorrect.'));
-    const secure = req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
-    return redirect(res, '/semaine', { 'Set-Cookie': `session=${encodeURIComponent(sign(user.id))}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000${secure}` });
+    return loggedIn(user);
+  }
+  if (p === '/inscription' && req.method === 'GET') return send(res, 200, signupPage());
+  if (p === '/inscription' && req.method === 'POST') {
+    const f = await readForm(req);
+    const { user, error } = await signup(f);
+    return user ? loggedIn(user) : send(res, 400, signupPage(error, f));
   }
 
   const user = currentUser(req);

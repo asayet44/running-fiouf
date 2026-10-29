@@ -11,6 +11,7 @@ services:
     environment:
       SESSION_SECRET: "<résultat de: openssl rand -hex 32>"
       CLAUDE_CODE_OAUTH_TOKEN: "<résultat de: claude setup-token>"
+      # SIGNUP_CODE: "<code à donner aux coureurs pour créer leur compte>"
     volumes:
       - /mnt/<pool>/apps/app-running/config:/config
       - /mnt/<pool>/apps/app-running/data:/data
