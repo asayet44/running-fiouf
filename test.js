@@ -71,3 +71,21 @@ assert.ok(s.parseParams(form({ zones: '157, 148' })).error);
 assert.ok(s.parseParams(form({ fcMax: '400' })).error);
 
 console.log('ok v2');
+
+// Connecteur Claude (MCP)
+(async () => {
+  const dir = require('node:fs').mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'mcp-'));
+  const u = { id: 'x', name: 'Fiouf', dir };
+  assert.strictEqual(await s.mcpRpc(u, { jsonrpc: '2.0', method: 'notifications/initialized' }), null);
+  assert.strictEqual((await s.mcpRpc(u, { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18' } })).result.protocolVersion, '2025-06-18');
+  assert.ok((await s.mcpRpc(u, { jsonrpc: '2.0', id: 2, method: 'tools/list' })).result.tools.some((t) => t.name === 'ajouter_note'));
+  assert.strictEqual((await s.mcpRpc(u, { jsonrpc: '2.0', id: 3, method: 'nope' })).error.code, -32601);
+  const call = (name, args) => s.mcpRpc(u, { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name, arguments: args } }).then((r) => r.result);
+  assert.ok(!(await call('ajouter_note', { texte: 'Genou gauche sensible' })).isError);
+  await call('ajouter_note', { texte: 'Dispo le mardi' });
+  assert.match(require('node:fs').readFileSync(`${dir}/CONTEXTE.md`, 'utf8'), /^\d{4}-\d\d-\d\d : Genou gauche sensible\n\n\d{4}-\d\d-\d\d : Dispo le mardi$/);
+  assert.ok((await call('ajouter_note', { texte: ' ' })).isError);
+  assert.ok((await call('modifier_parametres', { fcMax: 999 })).isError);
+  assert.ok((await call('inconnu', {})).isError);
+  console.log('ok mcp');
+})();

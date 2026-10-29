@@ -14,6 +14,7 @@ const SECRET = process.env.SESSION_SECRET || '';
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 const RUNNERS_DIR = process.env.RUNNERS_DIR || path.join(__dirname, 'runners'); // dossiers des projets coach
 const SIGNUP_CODE = process.env.SIGNUP_CODE || ''; // vide = création de compte libre
+const PUBLIC_URL = (process.env.PUBLIC_URL || '').replace(/\/$/, ''); // adresse HTTPS publique, pour le connecteur Claude
 
 // ---------- utilitaires purs (testés dans test.js) ----------
 
@@ -286,6 +287,91 @@ async function analyse(user, act, planned) {
   return result;
 }
 
+// ---------- connecteur Claude (MCP, Streamable HTTP sans état) ----------
+
+const TOOLS = [
+  { name: 'lire_profil', description: 'Prénom, objectif, notes « ce que mon coach doit savoir sur moi », paramètres actuels (FC en bpm, allure seuil en m/s, zones = plafonds FC Z1..Z7) et leur historique.', inputSchema: { type: 'object', properties: {} } },
+  { name: 'ajouter_note', description: 'Ajoute une note datée à la fin de « ce que mon coach doit savoir sur moi ». Le coach la relit avant chaque analyse.', inputSchema: { type: 'object', properties: { texte: { type: 'string' } }, required: ['texte'] } },
+  {
+    name: 'modifier_parametres',
+    description: "Corrige à la main des paramètres du coureur. Champ absent = inchangé, chaîne vide = revenir à la valeur d'intervals.icu.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        fcMax: { type: ['number', 'string'], description: 'bpm' }, fcSeuil: { type: ['number', 'string'], description: 'bpm' }, fcRepos: { type: ['number', 'string'], description: 'bpm' },
+        allureSeuil: { type: 'string', description: 'min/km, ex. "4:55"' }, vo2max: { type: ['number', 'string'] },
+        zones: { type: 'string', description: 'plafonds FC Z1 à Z7 en bpm, croissants, séparés par des virgules' },
+      },
+    },
+  },
+  { name: 'lire_avis_coach', description: 'Derniers avis du coach sur les séances faites (note sur 10, résumé, points forts, à améliorer, conseil pour la suite).', inputSchema: { type: 'object', properties: { nombre: { type: 'integer', minimum: 1, maximum: 50 } } } },
+];
+
+async function callTool(user, name, args = {}) {
+  if (name === 'lire_profil') {
+    const { params, history } = await currentParams(user);
+    return { prenom: user.name, objectif: user.objectif || 'Marathon · avril 2027', notes: readContext(user), parametres: params, corriges_a_la_main: Object.keys(user.params || {}), historique: history };
+  }
+  if (name === 'ajouter_note') {
+    const texte = String(args.texte || '').trim();
+    if (!texte) throw new Error('Note vide.');
+    const next = `${readContext(user).trimEnd()}\n\n${isoDay(new Date())} : ${texte}`.trim();
+    if (next.length > 20_000) throw new Error('Les notes dépassent 20 000 caractères : fais du tri dans la page Profil.');
+    fs.writeFileSync(contextFile(user), next);
+    return 'Note ajoutée.';
+  }
+  if (name === 'modifier_parametres') {
+    const f = new URLSearchParams();
+    for (const k of PARAM_KEYS) if (args[k] != null) f.set(k, String(args[k]));
+    const { params, error } = parseParams(f);
+    if (error) throw new Error(error);
+    const next = { ...user.params, ...params };
+    for (const k of PARAM_KEYS) if (args[k] === '') delete next[k];
+    updateUser(user.id, { params: next });
+    return { corriges_a_la_main: next };
+  }
+  if (name === 'lire_avis_coach') return recentAnalyses(user, Math.min(50, Number(args.nombre) || 5));
+  throw new Error(`Outil inconnu : ${name}`);
+}
+
+// Un message JSON-RPC -> réponse, ou null pour une notification.
+async function mcpRpc(user, msg) {
+  if (msg?.id === undefined) return null;
+  const ok = (result) => ({ jsonrpc: '2.0', id: msg.id, result });
+  switch (msg.method) {
+    case 'initialize':
+      return ok({
+        protocolVersion: msg.params?.protocolVersion || '2025-06-18',
+        capabilities: { tools: {} },
+        serverInfo: { name: 'app-running', version: '1.0.0' },
+        instructions: `App running de ${user.name}. Les séances prévues et faites sont dans intervals.icu (autre connecteur) ; ici : notes du coach, paramètres et avis du coach.`,
+      });
+    case 'ping': return ok({});
+    case 'tools/list': return ok({ tools: TOOLS });
+    case 'tools/call':
+      try {
+        const out = await callTool(user, msg.params?.name, msg.params?.arguments);
+        return ok({ content: [{ type: 'text', text: typeof out === 'string' ? out : JSON.stringify(out, null, 2) }] });
+      } catch (err) {
+        return ok({ content: [{ type: 'text', text: err.message }], isError: true });
+      }
+    default: return { jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: `Méthode inconnue : ${msg.method}` } };
+  }
+}
+
+const sameToken = (a, b) => crypto.timingSafeEqual(crypto.createHash('sha256').update(String(a)).digest(), crypto.createHash('sha256').update(String(b)).digest());
+const mcpUrl = (user) => `${PUBLIC_URL || 'https://<adresse publique>'}/mcp/${user.mcpToken}`;
+
+async function mcpHttp(req, res, user) {
+  if (req.method !== 'POST') { res.writeHead(405, { Allow: 'POST' }); return res.end(); }
+  let msg;
+  try { msg = JSON.parse(await readBody(req)); } catch { msg = null; }
+  const out = msg ? await mcpRpc(user, msg) : { jsonrpc: '2.0', id: null, error: { code: -32700, message: 'JSON invalide' } };
+  if (!out) { res.writeHead(202); return res.end(); }
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  return res.end(JSON.stringify(out));
+}
+
 // ---------- pages ----------
 
 const CSS = `
@@ -548,18 +634,23 @@ ${history.length ? `<section class="card" aria-label="Historique"><h2 style="mar
 ${[...history].reverse().slice(0, 12).map((h) => `<tr><td>${new Date(`${h.date}T12:00:00`).toLocaleDateString('fr-FR', { day: 'numeric', month: 'short' })}</td>
 <td>${h.fcRepos ?? '–'}</td><td>${h.fcSeuil ?? '–'}</td><td>${h.allureSeuil ? pace(h.allureSeuil) : '–'}</td><td>${h.vo2max ?? '–'}</td></tr>`).join('')}
 </table></div></section>` : ''}
+<section class="card"><h2 style="margin:0;font-size:16px">Connecter à Claude</h2>
+<p class="muted">Ajoute ce lien dans Claude.ai (Paramètres › Connecteurs › Ajouter un connecteur personnalisé) : tes projets Claude pourront lire et compléter tes notes, tes paramètres et les avis du coach. Garde-le secret.</p>
+${user.mcpToken ? `<input readonly aria-label="Lien du connecteur Claude" value="${esc(mcpUrl(user))}" onfocus="this.select()">` : ''}
+<form method="post" action="/profil/claude"><button class="btn${user.mcpToken ? ' ghost' : ''}" type="submit">${user.mcpToken ? 'Changer le lien (l\'ancien ne marchera plus)' : 'Créer mon lien Claude'}</button></form></section>
 <form method="post" action="/logout"><button class="btn ghost" type="submit" style="width:100%">Se déconnecter</button></form>`, 'profil');
 }
 
 // ---------- serveur ----------
 
-function readForm(req) {
+function readBody(req) {
   return new Promise((resolve, reject) => {
     let body = '';
-    req.on('data', (c) => { body += c; if (body.length > 64_000) { reject(new Error('Formulaire trop gros')); req.destroy(); } });
-    req.on('end', () => resolve(new URLSearchParams(body)));
+    req.on('data', (c) => { body += c; if (body.length > 64_000) { reject(new Error('Requête trop grosse')); req.destroy(); } });
+    req.on('end', () => resolve(body));
   });
 }
+const readForm = async (req) => new URLSearchParams(await readBody(req));
 
 function currentUser(req) {
   const m = /(?:^|;\s*)session=([^;]+)/.exec(req.headers.cookie || '');
@@ -574,6 +665,12 @@ async function handle(req, res) {
   const url = new URL(req.url, 'http://x');
   const p = url.pathname;
 
+  const mt = /^\/mcp\/([a-f0-9]{64})$/.exec(p);
+  if (mt) {
+    const u = loadUsers().find((x) => x.mcpToken && sameToken(x.mcpToken, mt[1]));
+    return u ? mcpHttp(req, res, u) : send(res, 404, '');
+  }
+  if (p.startsWith('/.well-known/')) return send(res, 404, ''); // pas d'OAuth : le lien secret suffit
   if (p === '/login' && req.method === 'GET') return send(res, 200, loginPage());
   const secure = req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
   const loggedIn = (user) => redirect(res, '/semaine', { 'Set-Cookie': `session=${encodeURIComponent(sign(user.id))}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000${secure}` });
@@ -601,6 +698,10 @@ async function handle(req, res) {
     const name = String(f.get('name') || '').trim().slice(0, 40);
     if (name) updateUser(user.id, { name });
     fs.writeFileSync(contextFile(user), String(f.get('contexte') || '').slice(0, 20_000));
+    return redirect(res, '/profil?ok');
+  }
+  if (p === '/profil/claude' && req.method === 'POST') {
+    updateUser(user.id, { mcpToken: crypto.randomBytes(32).toString('hex') });
     return redirect(res, '/profil?ok');
   }
   if (p === '/profil/parametres' && req.method === 'POST') {
@@ -656,4 +757,4 @@ if (require.main === module) {
   })).listen(PORT, () => console.log(`App running sur http://localhost:${PORT}`));
 }
 
-module.exports = { mergeParams, parsePace, zoneRange, stepLines, nextHistory, parseParams, hashPassword, checkPassword, sign, unsign, weekBounds, cleanTitle, planSummary, effortSplit, matchWeek, parseAnalysis, isoDay };
+module.exports = { mcpRpc, mergeParams, parsePace, zoneRange, stepLines, nextHistory, parseParams, hashPassword, checkPassword, sign, unsign, weekBounds, cleanTitle, planSummary, effortSplit, matchWeek, parseAnalysis, isoDay };
