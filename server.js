@@ -142,6 +142,77 @@ function nextHistory(history, params, day) {
   return last?.date === day ? [...history.slice(0, -1), entry] : [...history, entry];
 }
 
+// Streams intervals.icu ({time, distance, ...}) -> temps intermédiaires par km.
+// Temps de déplacement = pas de temps où l'on avance à plus de 0,5 m/s.
+function kmSplits({ time, distance, heartrate, altitude }) {
+  if (!time?.length || !distance?.length) return [];
+  const splits = [];
+  let start = 0;
+  let moving = 0;
+  const close = (end) => {
+    const hr = heartrate?.slice(start, end + 1).filter(Boolean) || [];
+    splits.push({
+      dist: distance[end] - distance[start], moving,
+      elev: altitude ? Math.round(altitude[end] - altitude[start]) : null,
+      hr: hr.length ? Math.round(hr.reduce((s, x) => s + x, 0) / hr.length) : null,
+    });
+  };
+  for (let i = 1; i < time.length; i++) {
+    const dt = time[i] - time[i - 1];
+    if (dt > 0 && (distance[i] - distance[i - 1]) / dt > 0.5) moving += dt;
+    if (distance[i] >= (splits.length + 1) * 1000) { close(i); start = i; moving = 0; }
+  }
+  if (distance.at(-1) - distance[start] >= 50) close(time.length - 1);
+  return splits;
+}
+
+// Courbe allure / distance en SVG, ligne pointillée = allure moyenne (s/km).
+function paceChart({ distance, velocity_smooth: v }, avgPace) {
+  if (!distance?.length || !v?.length) return '';
+  const total = distance.at(-1);
+  const n = 120;
+  const sums = Array.from({ length: n }, () => [0, 0]);
+  distance.forEach((d, i) => { if (v[i] > 0.5) { const b = sums[Math.min(n - 1, Math.floor((d / total) * n))]; b[0] += v[i]; b[1]++; } });
+  const pts = sums.map(([s, c], i) => c && [((i + 0.5) / n) * total, Math.min(720, Math.max(180, 1000 / (s / c)))]).filter(Boolean);
+  if (pts.length < 2) return '';
+  const ys = pts.map((p) => p[1]);
+  const lo = Math.floor(Math.min(...ys) / 30) * 30;
+  const hi = Math.ceil(Math.max(...ys) / 30) * 30 || lo + 30;
+  const W = 340, H = 140, x = (d) => (d / total) * W, y = (s) => ((s - lo) / Math.max(30, hi - lo)) * H; // rapide en haut
+  const line = pts.map(([d, s]) => `${x(d).toFixed(1)},${y(s).toFixed(1)}`).join(' ');
+  const mmss = (s) => `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, '0')}`;
+  const ay = y(Math.min(hi, Math.max(lo, avgPace)));
+  return `<svg viewBox="-34 -8 ${W + 40} ${H + 30}" width="100%" role="img" aria-label="Allure au fil de la sortie, moyenne ${mmss(avgPace)} par km" style="font:11px Manrope,system-ui,sans-serif">
+<polygon points="0,${H} ${line} ${W},${H}" fill="#C2410C" opacity=".12"/><polyline points="${line}" fill="none" stroke="#C2410C" stroke-width="2" stroke-linejoin="round"/>
+<line x1="0" x2="${W}" y1="${ay}" y2="${ay}" stroke="#17181B" stroke-dasharray="4 4"/>
+<text x="-6" y="4" text-anchor="end" fill="#55585F">${mmss(lo)}</text><text x="-6" y="${H}" text-anchor="end" fill="#55585F">${mmss(hi)}</text>
+<text x="0" y="${H + 18}" fill="#55585F">0 km</text><text x="${W}" y="${H + 18}" text-anchor="end" fill="#55585F">${km(total)} km</text></svg>`;
+}
+
+// Activités -> totaux des `count` dernières semaines (lundi -> dimanche), la plus récente en dernier.
+function weeklyTotals(acts, lastMonday, count = 12) {
+  const weeks = Array.from({ length: count }, (_, i) => {
+    const monday = new Date(lastMonday);
+    monday.setDate(lastMonday.getDate() - 7 * (count - 1 - i));
+    return { monday: isoDay(monday), dist: 0, time: 0, elev: 0, runs: 0 };
+  });
+  for (const a of acts) {
+    const w = weeks.findLast((wk) => wk.monday <= a.start_date_local.slice(0, 10));
+    if (!w) continue;
+    w.dist += a.distance || 0; w.time += a.moving_time || 0; w.elev += a.total_elevation_gain || 0; w.runs++;
+  }
+  return weeks;
+}
+
+// Semaines d'affilée avec au moins une sortie ; la semaine en cours ne casse pas la série tant qu'elle est vide.
+function weekStreak(weeks) {
+  let i = weeks.length - 1;
+  if (!weeks[i]?.runs) i--;
+  let n = 0;
+  while (i >= 0 && weeks[i].runs) { n++; i--; }
+  return n;
+}
+
 // ---------- formats ----------
 
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -185,6 +256,16 @@ async function icu(user, p) {
   });
   if (!res.ok) throw new Error(`intervals.icu ${res.status} sur ${p}`);
   return res.json();
+}
+
+// Courbes de la sortie, rangées par type ; latlng arrive en deux tableaux (data = lat, data2 = lng).
+async function streams(user, actId) {
+  const list = await icu(user, `/activity/${encodeURIComponent(actId)}/streams.json?types=time,distance,velocity_smooth,heartrate,altitude,latlng`).catch(() => []);
+  const out = {};
+  for (const st of Array.isArray(list) ? list : []) {
+    out[st.type] = st.type === 'latlng' && st.data2 ? st.data.map((lat, i) => [lat, st.data2[i]]) : st.data;
+  }
+  return out;
 }
 
 const analysisFile = (user, actId) => path.join(DATA_DIR, user.id, `${String(actId).replace(/[^\w-]/g, '')}.json`);
@@ -322,13 +403,13 @@ const icon = (k) => `<svg aria-hidden="true" width="24" height="24" viewBox="0 0
 function nav(current) {
   const link = (k, href, label) => `<a href="${href}"${current === k ? ' aria-current="page"' : ''}>${icon(k)}${label}</a>`;
   const soon = (k, label) => `<span aria-disabled="true" title="Bientôt">${icon(k)}${label}</span>`;
-  return `<nav aria-label="Navigation">${link('semaine', '/semaine', 'Semaine')}${soon('progres', 'Progrès')}${soon('nutrition', 'Nutrition')}${soon('muscu', 'Muscu')}${link('profil', '/profil', 'Profil')}</nav>`;
+  return `<nav aria-label="Navigation">${link('semaine', '/semaine', 'Semaine')}${link('progres', '/progres', 'Progrès')}${soon('nutrition', 'Nutrition')}${soon('muscu', 'Muscu')}${link('profil', '/profil', 'Profil')}</nav>`;
 }
 
-const page = (title, body, current) => `<!doctype html><html lang="fr"><head><meta charset="utf-8">
+const page = (title, body, current, head = '') => `<!doctype html><html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title>
 <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700;800&display=swap" rel="stylesheet">
-<style>${CSS}</style></head><body><main>${body}</main>${current ? nav(current) : ''}</body></html>`;
+<style>${CSS}</style>${head}</head><body><main>${body}</main>${current ? nav(current) : ''}</body></html>`;
 
 function loginPage(error) {
   return page('Connexion', `<div style="margin-top:12vh;display:flex;flex-direction:column;gap:8px">
@@ -438,7 +519,10 @@ ${plannedKm ? `<div class="bar" aria-hidden="true"><i style="width:${pct}%"></i>
 async function sessionPage(user, actId, error) {
   const act = await icu(user, `/activity/${encodeURIComponent(actId)}`);
   if (act.icu_athlete_id !== user.athleteId) return null;
-  const planned = act.paired_event_id ? await icu(user, `/athlete/${user.athleteId}/events/${act.paired_event_id}`).catch(() => null) : null;
+  const [planned, st] = await Promise.all([
+    act.paired_event_id ? icu(user, `/athlete/${user.athleteId}/events/${act.paired_event_id}`).catch(() => null) : null,
+    streams(user, act.id),
+  ]);
   const a = readAnalysis(user, act.id);
   const e = effortSplit(act.icu_hr_zone_times);
   const day = act.start_date_local.slice(0, 10);
@@ -470,9 +554,80 @@ ${e ? `<section class="card" aria-label="Intensité"><h2 style="margin:0;font-si
 <div class="stats" style="font-size:14px"><span><b>${e.facile} %</b> facile</span><span><b>${e.soutenu} %</b> soutenu</span><span><b>${e.dur} %</b> dur</span></div>
 ${planned ? `<p class="muted">Objectif : ${esc(planSummary(planned.description))}</p>` : ''}</section>` : ''}
 ${avis}
-<details class="card"><summary style="font-weight:700;cursor:pointer">Plus de détails</summary>
-${(act.interval_summary || []).map((s) => `<span class="muted">${esc(s)}</span>`).join('')}
-<span class="muted">Dénivelé + ${Math.round(act.total_elevation_gain || 0)} m · cadence ${Math.round((act.average_cadence || 0) * 2)} pas/min</span></details>`, 'semaine');
+${detailed(act, st)}`, 'semaine', st.latlng?.length ? LEAFLET : '');
+}
+
+const LEAFLET = '<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>';
+
+// L'onglet repliable façon Strava : carte, résumé, temps au km, courbe d'allure.
+function detailed(act, st) {
+  const avg = act.distance ? act.moving_time / (act.distance / 1000) : 0;
+  const splits = kmSplits(st);
+  const fastest = Math.min(...splits.map((x) => x.moving / x.dist));
+  const mmss = (s) => `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, '0')}`;
+  const route = (st.latlng || []).filter((ll) => ll && ll[0] != null);
+  const step = Math.ceil(route.length / 500);
+  const coords = route.filter((_, i) => i % step === 0 || i === route.length - 1);
+  const stat = (v, label) => `<div><div class="v" style="font-size:18px">${v}</div><span class="muted">${label}</span></div>`;
+  return `<details class="card" id="detail"><summary style="font-weight:700;cursor:pointer;min-height:24px">Analyse détaillée</summary>
+${coords.length > 1 ? `<div id="map" style="height:240px;border-radius:14px;background:#ECE9E3" role="img" aria-label="Carte du parcours"></div>
+<script>document.getElementById('detail').addEventListener('toggle', function once(e) {
+  if (!e.target.open || !window.L) return; e.target.removeEventListener('toggle', once);
+  const map = L.map('map', { attributionControl: true, scrollWheelZoom: false });
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '© OpenStreetMap' }).addTo(map);
+  const line = L.polyline(${JSON.stringify(coords.map(([a, b]) => [+a.toFixed(5), +b.toFixed(5)]))}, { color: '#C2410C', weight: 4 }).addTo(map);
+  map.fitBounds(line.getBounds(), { padding: [16, 16] });
+});</script>` : ''}
+<div class="grid2">${stat(`${km(act.distance)} km`, 'distance')}${stat(`${pace(act.average_speed)} /km`, 'allure moyenne')}
+${stat(duration(act.moving_time), 'durée de déplacement')}${stat(`${Math.round(act.total_elevation_gain || 0)} m`, 'dénivelé positif')}
+${stat(act.calories ? `${act.calories} kcal` : '–', 'calories')}${stat(act.average_heartrate ? `${act.average_heartrate} bpm` : '–', 'FC moyenne')}</div>
+${act.device_name ? `<span class="muted">Montre : ${esc(act.device_name)}</span>` : ''}
+${splits.length ? `<h2 style="font-size:16px">Temps intermédiaires</h2>
+<table><thead><tr><th>Km</th><th>Allure</th><th></th><th>Élév.</th><th>FC</th></tr></thead><tbody>
+${splits.map((x, i) => {
+  const sk = x.moving / x.dist * 1000;
+  return `<tr><td>${x.dist < 990 ? km(x.dist) : i + 1}</td><td>${mmss(sk)}</td>
+<td style="width:40%"><div style="height:10px;border-radius:5px;background:#F28A4B;width:${Math.round(100 * fastest * 1000 / sk)}%"></div></td>
+<td>${x.elev ?? '–'}</td><td>${x.hr ?? '–'}</td></tr>`;
+}).join('')}</tbody></table>` : ''}
+${st.velocity_smooth ? `<h2 style="font-size:16px">Allure</h2>${paceChart(st, avg)}` : ''}
+<div class="grid2">${stat(`${pace(act.average_speed)} /km`, 'allure moyenne')}${stat(duration(act.moving_time), 'durée de déplacement')}
+${act.elapsed_time && act.distance ? stat(`${mmss(act.elapsed_time / (act.distance / 1000))} /km`, 'allure sur le temps écoulé') : ''}
+${act.average_cadence ? stat(`${Math.round(act.average_cadence * 2)}`, 'pas par minute') : ''}</div>
+${(act.interval_summary || []).map((x) => `<span class="muted">${esc(x)}</span>`).join('')}</details>`;
+}
+
+async function progressPage(user, sel) {
+  const { monday } = weekBounds();
+  const oldest = new Date(monday);
+  oldest.setDate(monday.getDate() - 7 * 51);
+  const acts = await icu(user, `/athlete/${user.athleteId}/activities?oldest=${isoDay(oldest)}&newest=${isoDay(new Date())}`);
+  const year = weeklyTotals(acts.filter((a) => /Run/.test(a.type)), monday, 52);
+  const streak = weekStreak(year); // shortcut: série plafonnée à 52 semaines, élargir la requête si besoin
+  const weeks = year.slice(-12);
+  const i = Number.isInteger(sel) && sel >= 0 && sel < 12 ? sel : 11;
+  const w = weeks[i];
+  const end = new Date(`${w.monday}T12:00:00`);
+  end.setDate(end.getDate() + 6);
+  const W = 340, H = 140, max = Math.max(5000, ...weeks.map((x) => x.dist));
+  const pt = weeks.map((x, j) => [(j / 11) * W, H - (x.dist / max) * H]);
+  const line = pt.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(' ');
+  const short = (iso) => dayLabel(iso, { day: 'numeric', month: 'short' });
+  const chart = `<svg viewBox="-8 -12 ${W + 16} ${H + 36}" width="100%" style="font:11px Manrope,system-ui,sans-serif" aria-label="Kilomètres par semaine">
+<polygon points="0,${H} ${line} ${W},${H}" fill="#C2410C" opacity=".12"/><polyline points="${line}" fill="none" stroke="#C2410C" stroke-width="2"/>
+${pt.map(([x, y], j) => `<a href="/progres?s=${j}" aria-label="Semaine du ${short(weeks[j].monday)} : ${km(weeks[j].dist)} km">
+<circle cx="${x}" cy="${y}" r="14" fill="transparent"/><circle cx="${x}" cy="${y}" r="${j === i ? 6 : 4}" fill="${j === i ? '#C2410C' : '#fff'}" stroke="#C2410C" stroke-width="2"/></a>`).join('')}
+<text x="0" y="${H + 20}" fill="#55585F">${short(weeks[0].monday)}</text><text x="${W}" y="${H + 20}" text-anchor="end" fill="#55585F">cette semaine</text>
+<text x="0" y="-2" fill="#55585F">${km(max)} km</text></svg>`;
+  return page('Progrès', `<div><p class="muted">12 dernières semaines</p><h1>Progrès</h1></div>
+<section class="card" aria-label="Kilomètres par semaine">${chart}
+<p class="muted">${short(w.monday)} – ${short(isoDay(end))}${i === 11 ? ' · cette semaine' : ''}</p>
+<div class="grid3"><div><div class="v">${km(w.dist)} km</div><span class="muted">distance</span></div>
+<div><div class="v">${duration(w.time)}</div><span class="muted">temps</span></div>
+<div><div class="v">${Math.round(w.elev)} m</div><span class="muted">dénivelé</span></div></div></section>
+<section class="dark" aria-label="Série"><h2 style="margin:0">Série</h2>
+<div><span class="big">${streak} semaine${streak > 1 ? 's' : ''}</span><p class="muted">d'affilée avec au moins une sortie</p></div>
+<p class="muted">${year.reduce((s, x) => s + x.runs, 0)} sortie(s) et ${km(year.reduce((s, x) => s + x.dist, 0))} km sur 12 mois.</p></section>`, 'progres');
 }
 
 async function plannedPage(user, eventId) {
@@ -609,6 +764,7 @@ async function handle(req, res) {
     updateUser(user.id, { params });
     return redirect(res, '/profil?ok');
   }
+  if (p === '/progres') return send(res, 200, await progressPage(user, url.searchParams.has('s') ? Number(url.searchParams.get('s')) : undefined));
   const pm = /^\/prevu\/(\d+)$/.exec(p);
   if (pm && req.method === 'GET') {
     const html = await plannedPage(user, pm[1]);
@@ -656,4 +812,4 @@ if (require.main === module) {
   })).listen(PORT, () => console.log(`App running sur http://localhost:${PORT}`));
 }
 
-module.exports = { mergeParams, parsePace, zoneRange, stepLines, nextHistory, parseParams, hashPassword, checkPassword, sign, unsign, weekBounds, cleanTitle, planSummary, effortSplit, matchWeek, parseAnalysis, isoDay };
+module.exports = { kmSplits, paceChart, weeklyTotals, weekStreak, mergeParams, parsePace, zoneRange, stepLines, nextHistory, parseParams, hashPassword, checkPassword, sign, unsign, weekBounds, cleanTitle, planSummary, effortSplit, matchWeek, parseAnalysis, isoDay };

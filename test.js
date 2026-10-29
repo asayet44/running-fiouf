@@ -71,3 +71,22 @@ assert.ok(s.parseParams(form({ zones: '157, 148' })).error);
 assert.ok(s.parseParams(form({ fcMax: '400' })).error);
 
 console.log('ok v2');
+
+// v3 : temps au km, courbe d'allure, progrès
+const time = [], distance = [], heartrate = [], altitude = [];
+for (let t = 0; t <= 700; t++) { time.push(t); distance.push(Math.min(t, 600) * 3.5); heartrate.push(150); altitude.push(t < 300 ? t / 10 : 30); }
+const sp = s.kmSplits({ time, distance, heartrate, altitude });
+assert.deepStrictEqual(sp.map((x) => Math.round(x.dist)), [1001, 1001, 98]);
+assert.strictEqual(sp[0].hr, 150);
+assert.ok(sp[2].moving < 30); // l'arrêt final (100 s immobile) ne compte pas
+assert.deepStrictEqual(s.kmSplits({}), []);
+assert.match(s.paceChart({ distance, velocity_smooth: distance.map(() => 3.5) }, 286), /<svg/);
+const weeks = s.weeklyTotals([
+  { start_date_local: '2026-10-27T18:00:00', distance: 8000, moving_time: 2800, total_elevation_gain: 40 },
+  { start_date_local: '2026-10-21T18:00:00', distance: 5000, moving_time: 1800 },
+  { start_date_local: '2025-01-01T18:00:00', distance: 9000 },
+], new Date('2026-10-26T12:00:00'), 4);
+assert.deepStrictEqual(weeks.map((w) => [w.monday, w.dist]), [['2026-10-05', 0], ['2026-10-12', 0], ['2026-10-19', 5000], ['2026-10-26', 8000]]);
+assert.strictEqual(s.weekStreak(weeks), 2);
+assert.strictEqual(s.weekStreak([...weeks.slice(1), { runs: 0 }]), 2); // semaine en cours vide : série intacte
+console.log('ok v3');
