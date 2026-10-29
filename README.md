@@ -2,6 +2,7 @@
 
 Une petite app web mobile, une par coureur, au-dessus d'intervals.icu :
 
+- **Création de compte dans l'app** : e-mail, mot de passe et clé API intervals.icu (vérifiée), au premier passage.
 - **Connexion** : chaque coureur ne voit que ses données.
 - **Ma semaine** : une carte par séance prévue ou faite, et le bilan en bas (km, durée, score, séances faites).
 - **Détail d'une séance** : prévu vs réalisé, part facile / soutenu / dur, et **l'avis du coach** généré par Claude Code.
@@ -31,10 +32,12 @@ L'avis est gardé dans `data/<coureur>/<activité>.json` : il n'est généré qu
 
 | Dataset | Monté dans le conteneur | Contenu |
 |---|---|---|
-| `<pool>/apps/app-running/config` | `/config` | `users.json` (comptes des coureurs) |
+| `<pool>/apps/app-running/config` | `/config` | `users.json`, créé et rempli par l'app à chaque création de compte |
 | `<pool>/apps/app-running/data` | `/data` | avis du coach en cache + connexion Claude |
 
-Les dossiers des projets des coureurs (là où sont leurs notes / `CLAUDE.md`) sont montés tels quels dans `/runners/running` et `/runners/fiouf`.
+Par défaut, le contexte de chaque coureur est le texte de sa page Profil (gardé dans `data`) : colles-y ses notes de coureur.
+Optionnel : si les dossiers des projets Claude des coureurs sont sur le TrueNAS, monte-les sous `/runners/` (ligne commentée du compose) ;
+chaque coureur choisit alors le sien à la création de son compte et Claude y lit aussi son `CLAUDE.md`.
 L'utilisateur `apps` (568) doit pouvoir y écrire : l'app y enregistre `CONTEXTE.md` depuis la page Profil.
 
 **2. Accès à l'image** : le dépôt est privé, donc l'image aussi. Au choix :
@@ -45,14 +48,9 @@ L'utilisateur `apps` (568) doit pouvoir y écrire : l'app y enregistre `CONTEXTE
 - `SESSION_SECRET` : `openssl rand -hex 32`.
 - `CLAUDE_CODE_OAUTH_TOKEN` : sur une machine où Claude Code est connecté, `claude setup-token`. C'est ce qui permet au conteneur de lancer Claude avec ton abonnement.
 
-**4. `users.json`** dans le dataset `config`, à partir de `users.example.json`, un bloc par coureur :
-- `athleteId` : `i768176` (Running), `i769106` (Fiouf).
-- `apiKey` : intervals.icu › Settings › Developer Settings › API Key, **sur le compte du coureur**.
-- `dir` : `/runners/running` ou `/runners/fiouf`.
-- `password` : `docker run --rm ghcr.io/asayet44/running-fiouf node server.js hash 'mot de passe'`.
-
-**5. Lancer** : Apps › Discover Apps › ⋮ › *Install via YAML*, coller `docker-compose.yml` en remplaçant `<pool>`, les chemins et les deux secrets.
-L'app répond sur `http://<IP du TrueNAS>:3000`.
+**4. Lancer** : Apps › Discover Apps › ⋮ › *Install via YAML*, coller `docker-compose.yml` en remplaçant `<pool>`, les chemins et les deux secrets.
+L'app répond sur `http://<IP du TrueNAS>:3000` : chaque coureur clique sur « Créer mon compte ».
+Pour que seuls tes coureurs puissent créer un compte, ajoute `SIGNUP_CODE` et donne-leur ce code.
 
 Sans Docker : `SESSION_SECRET=... node server.js` (Node 22+), sous l'utilisateur où Claude Code est connecté.
 
@@ -70,3 +68,5 @@ ou un reverse proxy HTTPS. Derrière un proxy HTTPS qui envoie `X-Forwarded-Prot
 | `USERS_FILE` | `./users.json` |
 | `DATA_DIR` | `./data` |
 | `CLAUDE_BIN` | `claude` |
+| `RUNNERS_DIR` | `./runners` (`/runners` dans Docker) |
+| `SIGNUP_CODE` | vide = création de compte libre |
