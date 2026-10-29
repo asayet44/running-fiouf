@@ -23,40 +23,38 @@ L'avis est gardé dans `data/<coureur>/<activité>.json` : il n'est généré qu
 
 Ça utilise le compte Claude déjà connecté sur le serveur : pas de clé API Anthropic.
 
-## Installation sur le serveur (là où tourne Claude Code)
+## Installation sur TrueNAS (Docker)
 
-```sh
-git clone https://github.com/asayet44/running-fiouf app-running && cd app-running
-cp users.example.json users.json
-node server.js hash 'mot-de-passe-du-coureur'   # à coller dans "password"
-```
+À chaque push sur `main`, GitHub publie l'image `ghcr.io/asayet44/running-fiouf:latest` (onglet Actions).
 
-Dans `users.json`, pour chaque coureur :
+**1. Datasets à créer** (Datasets › Add Dataset, preset *Apps*, propriétaire `apps` / uid 568) :
 
-- `athleteId` : l'id intervals.icu (ex. `i769106`), visible dans l'URL de son profil.
+| Dataset | Monté dans le conteneur | Contenu |
+|---|---|---|
+| `<pool>/apps/app-running/config` | `/config` | `users.json` (comptes des coureurs) |
+| `<pool>/apps/app-running/data` | `/data` | avis du coach en cache + connexion Claude |
+
+Les dossiers des projets des coureurs (là où sont leurs notes / `CLAUDE.md`) sont montés tels quels dans `/runners/running` et `/runners/fiouf`.
+L'utilisateur `apps` (568) doit pouvoir y écrire : l'app y enregistre `CONTEXTE.md` depuis la page Profil.
+
+**2. Accès à l'image** : le dépôt est privé, donc l'image aussi. Au choix :
+- GitHub › Packages › running-fiouf › Package settings › *Change visibility* › Public (l'image ne contient aucun secret) ;
+- ou, dans TrueNAS, Apps › Configuration › *Manage Container Images* / registre `ghcr.io` avec un token GitHub `read:packages`.
+
+**3. Secrets** :
+- `SESSION_SECRET` : `openssl rand -hex 32`.
+- `CLAUDE_CODE_OAUTH_TOKEN` : sur une machine où Claude Code est connecté, `claude setup-token`. C'est ce qui permet au conteneur de lancer Claude avec ton abonnement.
+
+**4. `users.json`** dans le dataset `config`, à partir de `users.example.json`, un bloc par coureur :
+- `athleteId` : `i768176` (Running), `i769106` (Fiouf).
 - `apiKey` : intervals.icu › Settings › Developer Settings › API Key, **sur le compte du coureur**.
-- `dir` : le dossier de son projet Claude (celui qui contient ses notes). Il doit exister.
+- `dir` : `/runners/running` ou `/runners/fiouf`.
+- `password` : `docker run --rm ghcr.io/asayet44/running-fiouf node server.js hash 'mot de passe'`.
 
-Lancer :
+**5. Lancer** : Apps › Discover Apps › ⋮ › *Install via YAML*, coller `docker-compose.yml` en remplaçant `<pool>`, les chemins et les deux secrets.
+L'app répond sur `http://<IP du TrueNAS>:3000`.
 
-```sh
-SESSION_SECRET=$(openssl rand -hex 32) PORT=3000 node server.js
-npm test   # vérifie la logique
-```
-
-Pour qu'elle tourne en permanence, un service systemd suffit (ou une « Custom App » TrueNAS qui lance la même commande) :
-
-```ini
-[Service]
-WorkingDirectory=/chemin/app-running
-Environment=SESSION_SECRET=<secret fixe, sinon tout le monde est déconnecté au redémarrage>
-Environment=PORT=3000
-ExecStart=/usr/bin/node server.js
-Restart=always
-User=<l'utilisateur sous lequel Claude Code est connecté>
-```
-
-Le service doit tourner sous **le même utilisateur que Claude Code**, sinon `claude` ne sera pas connecté.
+Sans Docker : `SESSION_SECRET=... node server.js` (Node 22+), sous l'utilisateur où Claude Code est connecté.
 
 ## Sécurité
 
