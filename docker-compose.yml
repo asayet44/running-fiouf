@@ -1,5 +1,5 @@
 # TrueNAS : Apps › Discover Apps › ⋮ › Install via YAML, puis coller ce fichier.
-# Remplacer <pool> et les chemins des projets coureurs.
+# Remplacer <pool> et les deux secrets.
 services:
   app-running:
     image: ghcr.io/asayet44/running-fiouf:latest
@@ -15,5 +15,5 @@ services:
     volumes:
       - /mnt/<pool>/apps/app-running/config:/config
       - /mnt/<pool>/apps/app-running/data:/data
-      - /mnt/<pool>/<dossier du projet running>:/runners/running
-      - /mnt/<pool>/<dossier du projet running fiouf>:/runners/fiouf
+      # Optionnel : dossiers de projets Claude des coureurs présents sur le TrueNAS
+      # - /mnt/<pool>/<dossier du projet>:/runners/<nom>

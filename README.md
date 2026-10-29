@@ -35,8 +35,9 @@ L'avis est gardé dans `data/<coureur>/<activité>.json` : il n'est généré qu
 | `<pool>/apps/app-running/config` | `/config` | `users.json`, créé et rempli par l'app à chaque création de compte |
 | `<pool>/apps/app-running/data` | `/data` | avis du coach en cache + connexion Claude |
 
-Les dossiers des projets des coureurs (là où sont leurs notes / `CLAUDE.md`) sont montés tels quels sous `/runners/`.
-À la création de son compte, chaque coureur choisit le sien dans une liste.
+Par défaut, le contexte de chaque coureur est le texte de sa page Profil (gardé dans `data`) : colles-y ses notes de coureur.
+Optionnel : si les dossiers des projets Claude des coureurs sont sur le TrueNAS, monte-les sous `/runners/` (ligne commentée du compose) ;
+chaque coureur choisit alors le sien à la création de son compte et Claude y lit aussi son `CLAUDE.md`.
 L'utilisateur `apps` (568) doit pouvoir y écrire : l'app y enregistre `CONTEXTE.md` depuis la page Profil.
 
 **2. Accès à l'image** : le dépôt est privé, donc l'image aussi. Au choix :
