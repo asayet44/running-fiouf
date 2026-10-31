@@ -6,6 +6,8 @@ Une petite app web mobile, une par coureur, au-dessus d'intervals.icu :
 - **Connexion** : chaque coureur ne voit que ses données.
 - **Ma semaine** : une carte par séance prévue ou faite, et le bilan en bas (km, durée, score, séances faites).
 - **Détail d'une séance faite** : prévu vs réalisé, part facile / soutenu / dur, et **l'avis du coach** généré par Claude Code (avec « Refaire l'analyse »).
+  En dessous, l'onglet repliable **Analyse détaillée** : carte du parcours (OpenStreetMap), résumé, temps au km et courbe d'allure.
+- **Progrès** : km par semaine sur les 12 dernières semaines, détail de la semaine choisie et série de semaines actives.
 - **Détail d'une séance à venir** : le déroulé étape par étape avec les zones visées en bpm.
 - **Profil** : prénom, « Ce que mon coach doit savoir sur moi », et **Mes paramètres** (FC max, seuil, repos, allure seuil, VO2max, zones)
   remplis depuis intervals.icu, corrigeables à la main, avec l'historique de leur évolution.
