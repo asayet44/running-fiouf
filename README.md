@@ -60,6 +60,22 @@ Pour que seuls tes coureurs puissent créer un compte, ajoute `SIGNUP_CODE` et d
 
 Sans Docker : `SESSION_SECRET=... node server.js` (Node 22+), sous l'utilisateur où Claude Code est connecté.
 
+## Connecter à Claude.ai (connecteur MCP)
+
+L'app est aussi un connecteur pour Claude.ai : depuis n'importe quel projet Claude, on peut lire le profil du coureur
+(notes, paramètres, historique), lui **ajouter une note** pour le coach, **corriger ses paramètres** et lire **les derniers avis du coach**.
+Les séances elles-mêmes restent dans intervals.icu (connecteurs déjà existants).
+
+1. Rendre l'app joignable en HTTPS depuis internet, **uniquement pour les adresses `/mcp/…`**. Par exemple :
+   - Tailscale Funnel : `tailscale funnel --bg --set-path /mcp http://<IP du TrueNAS>:3000/mcp`
+   - Cloudflare Tunnel : une règle d'entrée `path: ^/mcp/` vers `http://<IP du TrueNAS>:3000`, puis `http_status:404` pour le reste.
+2. Mettre cette adresse dans `PUBLIC_URL` (compose), ex. `https://fiouf-case.xxx.ts.net`.
+3. Chaque coureur, dans **Profil › Connecter à Claude**, clique sur « Créer mon lien Claude » et colle le lien dans
+   Claude.ai › Paramètres › Connecteurs › *Ajouter un connecteur personnalisé*.
+
+Le lien contient un secret propre au coureur (pas d'OAuth) : qui l'a peut lire et modifier ses notes et paramètres.
+« Changer le lien » en crée un nouveau et désactive l'ancien.
+
 ## Sécurité
 
 Pas de limite de tentatives de connexion : n'exposez pas l'app directement sur Internet. Passez par un VPN (Tailscale, WireGuard)
@@ -76,3 +92,4 @@ ou un reverse proxy HTTPS. Derrière un proxy HTTPS qui envoie `X-Forwarded-Prot
 | `CLAUDE_BIN` | `claude` |
 | `RUNNERS_DIR` | `./runners` (`/runners` dans Docker) |
 | `SIGNUP_CODE` | vide = création de compte libre |
+| `PUBLIC_URL` | adresse HTTPS publique, pour afficher le lien du connecteur Claude |
