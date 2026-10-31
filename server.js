@@ -323,14 +323,61 @@ function updateUser(id, patch) {
 const contextFile = (user) => path.join(user.dir, 'CONTEXTE.md');
 const readContext = (user) => { try { return fs.readFileSync(contextFile(user), 'utf8'); } catch { return ''; } };
 
+// Contexte détaillé, une case par rubrique (Profil et outil modifier_contexte).
+const CONTEXT_FIELDS = [
+  ['objectif', 'Objectif', 'Course, date, distance, chrono visé, courses étapes…'],
+  ['blessures', 'Blessures et santé', 'Anciennes blessures, douleurs, sommeil, traitements…'],
+  ['planning', 'Travail et disponibilités', 'Jours travaillés, gardes, horaires, déplacements, jours où courir…'],
+  ['niveau', 'Historique et niveau', 'Depuis quand tu cours, records, volume habituel…'],
+  ['materiel', 'Matériel', 'Montre, chaussures, réglages…'],
+  ['preferences', 'Préférences', 'Terrain, moment de la journée, ce qui te motive ou te pèse…'],
+];
+const CONTEXT_KEYS = CONTEXT_FIELDS.map(([k]) => k);
+const fieldsFile = (user) => path.join(user.dir, 'contexte.json');
+const readFields = (user) => { try { return JSON.parse(fs.readFileSync(fieldsFile(user), 'utf8')); } catch { return {}; } };
+const writeFields = (user, fields) => fs.writeFileSync(fieldsFile(user), JSON.stringify(fields, null, 2));
+const labelledFields = (fields) => Object.fromEntries(CONTEXT_FIELDS.filter(([k]) => fields[k]).map(([k, label]) => [label, fields[k]]));
+
+// Flux iCal -> [{ jour, titre }] triés. shortcut: jour pris tel quel dans DTSTART (UTC non converti), suffit pour des gardes « journée entière ».
+function parseIcs(text) {
+  const out = [];
+  let ev = null;
+  for (const l of String(text).replace(/\r?\n[ \t]/g, '').split(/\r?\n/)) {
+    if (l === 'BEGIN:VEVENT') ev = {};
+    else if (l === 'END:VEVENT') { if (ev?.jour) out.push({ jour: ev.jour, titre: ev.titre || '' }); ev = null; }
+    else if (ev && /^DTSTART[;:]/.test(l)) { const m = /:(\d{4})(\d\d)(\d\d)/.exec(l); if (m) ev.jour = `${m[1]}-${m[2]}-${m[3]}`; }
+    else if (ev && /^SUMMARY[;:]/.test(l)) ev.titre = l.slice(l.indexOf(':') + 1).replace(/\\n/gi, ' ').replace(/\\(.)/g, '$1');
+  }
+  return out.sort((a, b) => a.jour.localeCompare(b.jour));
+}
+
+// "webcal://…" -> "https://…" ; seules les adresses https sont acceptées.
+function parseIcsUrl(raw) {
+  const s = String(raw || '').trim().replace(/^webcal:\/\//i, 'https://');
+  if (!s) return '';
+  try { return new URL(s).protocol === 'https:' ? s : null; } catch { return null; }
+}
+
+// Jours de travail des `days` prochains jours, lus dans le calendrier du coureur (null si pas de calendrier).
+async function workDays(user, days = 28) {
+  if (!user.icsUrl) return null;
+  const res = await fetch(user.icsUrl, { signal: AbortSignal.timeout(10_000) });
+  if (!res.ok) throw new Error(`le calendrier répond ${res.status}`);
+  const end = new Date(); end.setDate(end.getDate() + days);
+  const today = isoDay(new Date());
+  return parseIcs(await res.text()).filter((e) => e.jour >= today && e.jour <= isoDay(end));
+}
+const workDaysOrError = (user, days) => workDays(user, days).catch((err) => ({ erreur: `Calendrier illisible : ${err.message}` }));
+
 const running = new Set();
 
 async function analyse(user, act, planned) {
   const today = isoDay(new Date());
   const in7 = new Date(); in7.setDate(in7.getDate() + 7);
-  const [upcoming, { params }] = await Promise.all([
+  const [upcoming, { params }, travail] = await Promise.all([
     icu(user, `/athlete/${user.athleteId}/events?oldest=${today}&newest=${isoDay(in7)}&category=WORKOUT`),
     currentParams(user),
+    workDaysOrError(user, 14),
   ]);
   const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
   const prompt = [
@@ -351,6 +398,10 @@ async function analyse(user, act, planned) {
     JSON.stringify(params),
     '## Contexte donné par le coureur',
     readContext(user) || '(vide)',
+    '## Contexte détaillé par rubrique',
+    JSON.stringify(labelledFields(readFields(user))),
+    '## Planning de travail des 14 prochains jours (tiens-en compte pour le conseil de la prochaine séance)',
+    travail ? JSON.stringify(travail) : 'Non renseigné.',
     '## Tes derniers avis',
     JSON.stringify(recentAnalyses(user)),
   ].join('\n');
@@ -371,7 +422,7 @@ async function analyse(user, act, planned) {
 // ---------- connecteur Claude (MCP, Streamable HTTP sans état) ----------
 
 const TOOLS = [
-  { name: 'lire_profil', description: 'Prénom, objectif, notes « ce que mon coach doit savoir sur moi », paramètres actuels (FC en bpm, allure seuil en m/s, zones = plafonds FC Z1..Z7) et leur historique.', inputSchema: { type: 'object', properties: {} } },
+  { name: 'lire_profil', description: 'Prénom, objectif, notes « ce que mon coach doit savoir sur moi », contexte détaillé par rubrique, jours de travail des 4 prochaines semaines (calendrier du coureur), paramètres actuels (FC en bpm, allure seuil en m/s, zones = plafonds FC Z1..Z7) et leur historique.', inputSchema: { type: 'object', properties: {} } },
   { name: 'ajouter_note', description: 'Ajoute une note datée à la fin de « ce que mon coach doit savoir sur moi ». Le coach la relit avant chaque analyse.', inputSchema: { type: 'object', properties: { texte: { type: 'string' } }, required: ['texte'] } },
   {
     name: 'modifier_parametres',
@@ -385,13 +436,26 @@ const TOOLS = [
       },
     },
   },
+  {
+    name: 'modifier_contexte',
+    description: `Écrit dans une rubrique du contexte détaillé du coureur (relu par le coach avant chaque analyse). Rubriques : ${CONTEXT_FIELDS.map(([k, l]) => `${k} (${l})`).join(', ')}. mode « remplacer » (défaut) écrase la rubrique, texte vide = la vider ; « ajouter » ajoute une ligne datée.`,
+    inputSchema: {
+      type: 'object',
+      properties: { rubrique: { type: 'string', enum: CONTEXT_KEYS }, texte: { type: 'string' }, mode: { type: 'string', enum: ['remplacer', 'ajouter'] } },
+      required: ['rubrique', 'texte'],
+    },
+  },
   { name: 'lire_avis_coach', description: 'Derniers avis du coach sur les séances faites (note sur 10, résumé, points forts, à améliorer, conseil pour la suite).', inputSchema: { type: 'object', properties: { nombre: { type: 'integer', minimum: 1, maximum: 50 } } } },
 ];
 
 async function callTool(user, name, args = {}) {
   if (name === 'lire_profil') {
     const { params, history } = await currentParams(user);
-    return { prenom: user.name, objectif: user.objectif || 'Marathon · avril 2027', notes: readContext(user), parametres: params, corriges_a_la_main: Object.keys(user.params || {}), historique: history };
+    return {
+      prenom: user.name, objectif: user.objectif || 'Marathon · avril 2027', notes: readContext(user), contexte: readFields(user),
+      planning_travail: (await workDaysOrError(user, 28)) ?? 'Pas de calendrier relié (Profil › Mon contexte détaillé).',
+      parametres: params, corriges_a_la_main: Object.keys(user.params || {}), historique: history,
+    };
   }
   if (name === 'ajouter_note') {
     const texte = String(args.texte || '').trim();
@@ -410,6 +474,18 @@ async function callTool(user, name, args = {}) {
     for (const k of PARAM_KEYS) if (args[k] === '') delete next[k];
     updateUser(user.id, { params: next });
     return { corriges_a_la_main: next };
+  }
+  if (name === 'modifier_contexte') {
+    if (!CONTEXT_KEYS.includes(args.rubrique)) throw new Error(`Rubrique inconnue. Choix : ${CONTEXT_KEYS.join(', ')}.`);
+    const texte = String(args.texte ?? '').trim();
+    const fields = readFields(user);
+    const old = fields[args.rubrique] || '';
+    const next = args.mode === 'ajouter' ? `${old.trimEnd()}\n${isoDay(new Date())} : ${texte}`.trim() : texte;
+    if (args.mode === 'ajouter' && !texte) throw new Error('Texte vide.');
+    if (next.length > 5000) throw new Error('Rubrique limitée à 5 000 caractères : résume ou remplace.');
+    if (next) fields[args.rubrique] = next; else delete fields[args.rubrique];
+    writeFields(user, fields);
+    return { [args.rubrique]: next };
   }
   if (name === 'lire_avis_coach') return recentAnalyses(user, Math.min(50, Number(args.nombre) || 5));
   throw new Error(`Outil inconnu : ${name}`);
@@ -765,7 +841,8 @@ function parseParams(f) {
 }
 
 async function profilePage(user, msg, error) {
-  const { params, auto, history } = await currentParams(user);
+  const [{ params, auto, history }, travail] = await Promise.all([currentParams(user), workDaysOrError(user, 14)]);
+  const fields = readFields(user);
   const manual = user.params || {};
   return page('Profil', `<div style="display:flex;align-items:center;gap:14px">
 <span aria-hidden="true" style="width:56px;height:56px;border-radius:28px;background:#C2410C;color:#fff;font-size:24px;font-weight:800;display:flex;align-items:center;justify-content:center">${esc(user.name.charAt(0))}</span>
@@ -778,6 +855,17 @@ ${msg ? `<p role="status" style="color:#1D7A46;font-weight:600">${esc(msg)}</p>`
 <p class="muted">Claude relit ce texte avant chaque analyse, avec tes dernières séances et ses anciens avis.</p>
 <textarea id="ctx" name="contexte" rows="8" maxlength="20000" placeholder="Blessures, contraintes, disponibilités, ce qui te motive…">${esc(readContext(user))}</textarea>
 <button class="btn" type="submit" style="align-self:flex-start">Enregistrer</button></form>
+<details class="card"${error && /^Calendrier/.test(error) ? ' open' : ''}><summary style="font-weight:800;cursor:pointer;min-height:24px">Mon contexte détaillé</summary>
+<p class="muted">Une case par sujet, pour que le coach affine ses analyses et le plan. Claude peut aussi les remplir depuis tes projets.</p>
+<form method="post" action="/profil/contexte" style="display:flex;flex-direction:column;gap:10px">
+${CONTEXT_FIELDS.map(([k, label, hint]) => `<label for="cx-${k}">${label}</label><textarea id="cx-${k}" name="${k}" rows="3" maxlength="5000" placeholder="${esc(hint)}">${esc(fields[k])}</textarea>`).join('')}
+<button class="btn" type="submit" style="align-self:flex-start">Enregistrer mon contexte</button></form>
+<form method="post" action="/profil/calendrier" style="display:flex;flex-direction:column;gap:10px;margin-top:8px">
+<label for="ics">Mon calendrier de travail (lien iCal / .ics)</label>
+<p class="muted">L'app y lit tes jours travaillés pour adapter les conseils. Garde ce lien secret ; vide le champ pour le retirer.</p>
+<input id="ics" name="icsUrl" type="url" autocomplete="off" placeholder="https://… ou webcal://…" value="${esc(user.icsUrl)}">
+${travail?.erreur ? `<p class="err">${esc(travail.erreur)}</p>` : travail ? `<p class="muted">${travail.length ? `Prochains jours : ${travail.slice(0, 10).map((e) => `${dayLabel(e.jour, { weekday: 'short', day: 'numeric' })} ${esc(e.titre)}`).join(' · ')}` : 'Aucun jour de travail dans les 2 prochaines semaines.'}</p>` : ''}
+<button class="btn ghost" type="submit" style="align-self:flex-start">Enregistrer le lien</button></form></details>
 <form method="post" action="/profil/parametres" class="card"><h2 style="margin:0;font-size:16px">Mes paramètres</h2>
 <p class="muted">Remplis automatiquement depuis intervals.icu. Écris une valeur pour la corriger, vide le champ pour revenir à celle d'intervals.icu.</p>
 <div class="pf">${PARAM_FIELDS.map(([k, label, unit]) => `<label${k === 'zones' ? ' style="grid-column:1/-1"' : ''}>${label}${unit ? ` (${unit})` : ''}
@@ -855,6 +943,17 @@ async function handle(req, res) {
     fs.writeFileSync(contextFile(user), String(f.get('contexte') || '').slice(0, 20_000));
     return redirect(res, '/profil?ok');
   }
+  if (p === '/profil/contexte' && req.method === 'POST') {
+    const f = await readForm(req);
+    writeFields(user, Object.fromEntries(CONTEXT_KEYS.map((k) => [k, String(f.get(k) || '').trim().slice(0, 5000)]).filter(([, v]) => v)));
+    return redirect(res, '/profil?ok');
+  }
+  if (p === '/profil/calendrier' && req.method === 'POST') {
+    const icsUrl = parseIcsUrl((await readForm(req)).get('icsUrl'));
+    if (icsUrl == null) return send(res, 400, await profilePage(user, '', 'Calendrier : lien invalide (https:// ou webcal:// attendu).'));
+    updateUser(user.id, { icsUrl });
+    return redirect(res, '/profil?ok');
+  }
   if (p === '/profil/claude' && req.method === 'POST') {
     updateUser(user.id, { mcpToken: crypto.randomBytes(32).toString('hex') });
     return redirect(res, '/profil?ok');
@@ -913,4 +1012,4 @@ if (require.main === module) {
   })).listen(PORT, () => console.log(`App running sur http://localhost:${PORT}`));
 }
 
-module.exports = { mcpRpc, kmSplits, paceChart, weeklyTotals, weekStreak, mergeParams, parsePace, zoneRange, stepLines, nextHistory, parseParams, hashPassword, checkPassword, sign, unsign, weekBounds, cleanTitle, planSummary, effortSplit, matchWeek, parseAnalysis, isoDay };
+module.exports = { mcpRpc, parseIcs, parseIcsUrl, kmSplits, paceChart, weeklyTotals, weekStreak, mergeParams, parsePace, zoneRange, stepLines, nextHistory, parseParams, hashPassword, checkPassword, sign, unsign, weekBounds, cleanTitle, planSummary, effortSplit, matchWeek, parseAnalysis, isoDay };

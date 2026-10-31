@@ -42,6 +42,11 @@ L'avis est gardé dans `data/<coureur>/<activité>.json` : il n'est généré qu
 | `<pool>/apps/app-running/data` | `/data` | avis du coach en cache + connexion Claude |
 
 Par défaut, le contexte de chaque coureur est le texte de sa page Profil (gardé dans `data`) : colles-y ses notes de coureur.
+
+Dans **Profil › Mon contexte détaillé**, une case par rubrique (objectif, blessures et santé, travail et disponibilités, historique,
+matériel, préférences), gardée dans `contexte.json` à côté de `CONTEXTE.md`, et un lien iCal (.ics / webcal) vers le calendrier de
+travail du coureur. L'app lit ce calendrier à chaque analyse (14 prochains jours) ; le lien est gardé dans `users.json` comme la clé
+intervals.icu. Le serveur doit pouvoir joindre l'hôte du calendrier.
 Optionnel : si les dossiers des projets Claude des coureurs sont sur le TrueNAS, monte-les sous `/runners/` (ligne commentée du compose) ;
 chaque coureur choisit alors le sien à la création de son compte et Claude y lit aussi son `CLAUDE.md`.
 L'utilisateur `apps` (568) doit pouvoir y écrire : l'app y enregistre `CONTEXTE.md` depuis la page Profil.
@@ -63,7 +68,7 @@ Sans Docker : `SESSION_SECRET=... node server.js` (Node 22+), sous l'utilisateur
 ## Connecter à Claude.ai (connecteur MCP)
 
 L'app est aussi un connecteur pour Claude.ai : depuis n'importe quel projet Claude, on peut lire le profil du coureur
-(notes, paramètres, historique), lui **ajouter une note** pour le coach, **corriger ses paramètres** et lire **les derniers avis du coach**.
+(notes, paramètres, historique), lui **ajouter une note** pour le coach, **remplir son contexte détaillé** (outil `modifier_contexte`), **corriger ses paramètres** et lire **les derniers avis du coach**.
 Les séances elles-mêmes restent dans intervals.icu (connecteurs déjà existants).
 
 1. Rendre l'app joignable en HTTPS depuis internet, **uniquement pour les adresses `/mcp/…`**. Par exemple :
