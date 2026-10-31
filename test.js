@@ -91,6 +91,14 @@ assert.strictEqual(s.weekStreak(weeks), 2);
 assert.strictEqual(s.weekStreak([...weeks.slice(1), { runs: 0 }]), 2); // semaine en cours vide : série intacte
 console.log('ok v3');
 
+const ics = 'BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nDTSTART;VALUE=DATE:20261103\r\nSUMMARY:N: Visite 0-\r\n 4\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nDTSTART:20261102T090000Z\r\nSUMMARY:J: Cs Ntes\\, poste 2\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n';
+assert.deepStrictEqual(s.parseIcs(ics), [{ jour: '2026-11-02', titre: 'J: Cs Ntes, poste 2' }, { jour: '2026-11-03', titre: 'N: Visite 0-4' }]);
+assert.strictEqual(s.parseIcsUrl('webcal://exemple.fr/a.ics'), 'https://exemple.fr/a.ics');
+assert.strictEqual(s.parseIcsUrl(' '), '');
+assert.strictEqual(s.parseIcsUrl('http://exemple.fr/a.ics'), null);
+assert.strictEqual(s.parseIcsUrl('pas un lien'), null);
+console.log('ok ics');
+
 // Connecteur Claude (MCP)
 (async () => {
   const dir = require('node:fs').mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'mcp-'));
@@ -106,5 +114,11 @@ console.log('ok v3');
   assert.ok((await call('ajouter_note', { texte: ' ' })).isError);
   assert.ok((await call('modifier_parametres', { fcMax: 999 })).isError);
   assert.ok((await call('inconnu', {})).isError);
+  await call('modifier_contexte', { rubrique: 'blessures', texte: 'LCP droit opéré' });
+  await call('modifier_contexte', { rubrique: 'blessures', texte: 'Genou ok', mode: 'ajouter' });
+  assert.match((await call('lire_profil', {}).catch(() => null))?.content?.[0]?.text ?? '', /LCP droit opéré\\n\d{4}-\d\d-\d\d : Genou ok/);
+  assert.ok((await call('modifier_contexte', { rubrique: 'inconnue', texte: 'x' })).isError);
+  await call('modifier_contexte', { rubrique: 'blessures', texte: '' });
+  assert.deepStrictEqual(JSON.parse(require('node:fs').readFileSync(`${dir}/contexte.json`, 'utf8')), {});
   console.log('ok mcp');
 })();
