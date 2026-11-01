@@ -631,8 +631,10 @@ async function signup(f) {
   return { user };
 }
 
-async function weekPage(user) {
-  const { monday, sunday } = weekBounds();
+async function weekPage(user, offset = 0) {
+  const ref = new Date();
+  ref.setDate(ref.getDate() + 7 * offset);
+  const { monday, sunday } = weekBounds(ref);
   const today = isoDay(new Date());
   const q = `oldest=${isoDay(monday)}&newest=${isoDay(sunday)}`;
   const [events, acts] = await Promise.all([
@@ -650,6 +652,7 @@ async function weekPage(user) {
   const plannedKm = events.reduce((s, e) => s + (e.distance || 0), 0);
   const time = runs.reduce((s, a) => s + (a.moving_time || 0), 0);
   const todayCard = cards.find((c) => c.day === today && c.ev);
+  const weekLink = (o, label, txt) => `<a class="muted" href="/semaine${o ? `?w=${o}` : ''}" aria-label="${label}" style="min-height:44px;min-width:44px;display:flex;align-items:center;justify-content:center">${txt}</a>`;
 
   const cardHtml = cards.map(({ day, ev, act }) => {
     const title = esc(cleanTitle(ev ? ev.name : act.name));
@@ -665,10 +668,10 @@ ${ev ? `<span class="muted">${esc(planSummary(ev.description))}</span>` : ''}
   }).join('\n');
 
   const pct = plannedKm ? Math.min(100, Math.round((100 * doneKm) / plannedKm)) : 0;
-  return page('Ma semaine', `<div><p class="muted">Semaine du ${dayLabel(isoDay(monday), { day: 'numeric', month: 'short' })} au ${dayLabel(isoDay(sunday), { day: 'numeric', month: 'short' })}</p>
-<h1>Salut ${esc(user.name)}</h1></div>
-<${todayCard ? `a href="/prevu/${encodeURIComponent(todayCard.ev.id)}"` : 'div'} class="today" style="display:block"><b>AUJOURD'HUI</b><span class="title">${todayCard ? esc(cleanTitle(todayCard.ev.name)) : 'Repos'}</span>
-${todayCard ? `<p class="muted">${esc(planSummary(todayCard.ev.description))}</p>` : ''}</${todayCard ? 'a' : 'div'}>
+  return page('Ma semaine', `<div><div class="row">${weekLink(offset - 1, 'Semaine précédente', '‹')}<p class="muted">Semaine du ${dayLabel(isoDay(monday), { day: 'numeric', month: 'short' })} au ${dayLabel(isoDay(sunday), { day: 'numeric', month: 'short' })}</p>${weekLink(offset + 1, 'Semaine suivante', '›')}</div>
+<h1>Salut ${esc(user.name)}</h1>${offset ? `<a class="muted" href="/semaine">Revenir à cette semaine</a>` : ''}</div>
+${offset ? '' : `<${todayCard ? `a href="/prevu/${encodeURIComponent(todayCard.ev.id)}"` : 'div'} class="today" style="display:block"><b>AUJOURD'HUI</b><span class="title">${todayCard ? esc(cleanTitle(todayCard.ev.name)) : 'Repos'}</span>
+${todayCard ? `<p class="muted">${esc(planSummary(todayCard.ev.description))}</p>` : ''}</${todayCard ? 'a' : 'div'}>`}
 <h2>Mes séances</h2>${cardHtml || '<p class="muted">Aucune séance prévue cette semaine.</p>'}
 <section class="dark" aria-label="Bilan de la semaine"><h2 style="margin:0">Ma semaine</h2>
 <div class="row"><span class="big">${km(doneKm)} km</span>${plannedKm ? `<span class="muted">sur ${km(plannedKm)} km prévus</span>` : ''}</div>
@@ -934,7 +937,7 @@ async function handle(req, res) {
   if (!user) return redirect(res, '/login');
 
   if (p === '/logout' && req.method === 'POST') return redirect(res, '/login', { 'Set-Cookie': 'session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0' });
-  if (p === '/' || p === '/semaine') return send(res, 200, await weekPage(user));
+  if (p === '/' || p === '/semaine') return send(res, 200, await weekPage(user, Math.max(-52, Math.min(52, parseInt(url.searchParams.get('w'), 10) || 0))));
   if (p === '/profil' && req.method === 'GET') return send(res, 200, await profilePage(user, url.searchParams.has('ok') ? 'Enregistré.' : ''));
   if (p === '/profil' && req.method === 'POST') {
     const f = await readForm(req);
