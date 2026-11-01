@@ -122,3 +122,8 @@ console.log('ok ics');
   assert.deepStrictEqual(JSON.parse(require('node:fs').readFileSync(`${dir}/contexte.json`, 'utf8')), {});
   console.log('ok mcp');
 })();
+
+const bilan = s.parseBilan(JSON.stringify({ result: 'Voilà : {"positif": "Régulier", "negatif": "", "aprevoir": "Repos lundi"}' }));
+assert.deepStrictEqual(bilan, { positif: 'Régulier', negatif: '', aprevoir: 'Repos lundi' });
+assert.throws(() => s.parseBilan(JSON.stringify({ result: '{}' })));
+console.log('ok bilan');
