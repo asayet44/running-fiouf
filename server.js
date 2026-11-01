@@ -99,6 +99,16 @@ function parseAnalysis(stdout) {
   return { note, resume: str(a.resume), bien: str(a.bien), ameliorer: str(a.ameliorer), prochaine: str(a.prochaine) };
 }
 
+// Bilan de semaine renvoyé par Claude : {"positif", "negatif", "aprevoir"}.
+function parseBilan(stdout) {
+  const m = (JSON.parse(stdout).result || '').match(/\{[\s\S]*\}/);
+  if (!m) throw new Error('Réponse de Claude sans JSON');
+  const b = JSON.parse(m[0]);
+  const str = (v) => String(v || '').slice(0, 3000);
+  if (!b.positif && !b.negatif && !b.aprevoir) throw new Error('Bilan vide');
+  return { positif: str(b.positif), negatif: str(b.negatif), aprevoir: str(b.aprevoir) };
+}
+
 // ---------- paramètres et zones ----------
 
 const PARAM_KEYS = ['fcMax', 'fcSeuil', 'fcRepos', 'allureSeuil', 'vo2max', 'zones'];
@@ -283,6 +293,20 @@ function recentAnalyses(user, n = 3) {
     .sort((a, b) => b.date.localeCompare(a.date)).slice(0, n);
 }
 
+// Une semaine = DATA_DIR/<id>/semaines/<lundi>.json : { ressenti, bilan }. Dossier à part pour que recentAnalyses ne le lise pas.
+const weekFile = (user, monday) => path.join(DATA_DIR, user.id, 'semaines', `${monday}.json`);
+const readWeek = (user, monday) => { try { return JSON.parse(fs.readFileSync(weekFile(user, monday), 'utf8')); } catch { return {}; } };
+function writeWeek(user, monday, patch) {
+  fs.mkdirSync(path.dirname(weekFile(user, monday)), { recursive: true });
+  fs.writeFileSync(weekFile(user, monday), JSON.stringify({ ...readWeek(user, monday), ...patch }, null, 2));
+}
+function recentWeeks(user, n = 4) {
+  const dir = path.join(DATA_DIR, user.id, 'semaines');
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir).filter((f) => f.endsWith('.json')).sort().reverse().slice(0, n)
+    .map((f) => ({ semaine_du: f.slice(0, 10), ...readWeek(user, f.slice(0, 10)) }));
+}
+
 const HISTORY_FILE = 'parametres.json';
 const historyFile = (user) => path.join(DATA_DIR, user.id, HISTORY_FILE);
 const readHistory = (user) => { try { return JSON.parse(fs.readFileSync(historyFile(user), 'utf8')); } catch { return []; } };
@@ -371,6 +395,14 @@ const workDaysOrError = (user, days) => workDays(user, days).catch((err) => ({ e
 
 const running = new Set();
 
+const askClaude = (user, prompt) => new Promise((resolve, reject) => {
+  const child = execFile(CLAUDE_BIN,
+    ['-p', '--model', 'opus', '--effort', 'medium', '--output-format', 'json', '--tools', '', '--no-session-persistence'],
+    { cwd: user.dir, timeout: 5 * 60_000, maxBuffer: 10_000_000 },
+    (err, out, errOut) => (err ? reject(new Error(errOut || err.message)) : resolve(out)));
+  child.stdin.end(prompt);
+});
+
 async function analyse(user, act, planned) {
   const today = isoDay(new Date());
   const in7 = new Date(); in7.setDate(in7.getDate() + 7);
@@ -402,21 +434,53 @@ async function analyse(user, act, planned) {
     JSON.stringify(labelledFields(readFields(user))),
     '## Planning de travail des 14 prochains jours (tiens-en compte pour le conseil de la prochaine séance)',
     travail ? JSON.stringify(travail) : 'Non renseigné.',
+    '## Ressenti noté par le coureur (fatigue, douleurs…) des dernières semaines',
+    JSON.stringify(recentWeeks(user, 2).map((w) => ({ semaine_du: w.semaine_du, ressenti: w.ressenti }))),
     '## Tes derniers avis',
     JSON.stringify(recentAnalyses(user)),
   ].join('\n');
 
-  const stdout = await new Promise((resolve, reject) => {
-    const child = execFile(CLAUDE_BIN,
-      ['-p', '--model', 'opus', '--effort', 'medium', '--output-format', 'json', '--tools', '', '--no-session-persistence'],
-      { cwd: user.dir, timeout: 5 * 60_000, maxBuffer: 10_000_000 },
-      (err, out, errOut) => (err ? reject(new Error(errOut || err.message)) : resolve(out)));
-    child.stdin.end(prompt);
-  });
+  const stdout = await askClaude(user, prompt);
   const result = { ...parseAnalysis(stdout), date: new Date().toISOString(), activityId: act.id };
   fs.mkdirSync(path.join(DATA_DIR, user.id), { recursive: true });
   fs.writeFileSync(analysisFile(user, act.id), JSON.stringify(result, null, 2));
   return result;
+}
+
+async function weekBilan(user, mondayIso) {
+  const sunday = new Date(`${mondayIso}T12:00:00`); sunday.setDate(sunday.getDate() + 6);
+  const next = new Date(sunday); next.setDate(next.getDate() + 7);
+  const q = `oldest=${mondayIso}&newest=${isoDay(sunday)}`;
+  const [events, acts, upcoming, { params }, travail] = await Promise.all([
+    icu(user, `/athlete/${user.athleteId}/events?${q}&category=WORKOUT`),
+    icu(user, `/athlete/${user.athleteId}/activities?${q}`),
+    icu(user, `/athlete/${user.athleteId}/events?oldest=${isoDay(new Date(sunday.getTime() + 86_400_000))}&newest=${isoDay(next)}&category=WORKOUT`),
+    currentParams(user),
+    workDaysOrError(user, 14),
+  ]);
+  const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
+  const runs = acts.filter((a) => /Run/.test(a.type));
+  const prompt = [
+    `Tu es le coach running de ${user.name}, qui prépare ${user.objectif || 'un marathon'}.`,
+    `Fais le bilan complet de sa semaine du ${mondayIso} : séances prévues contre faites, volume, intensité, régularité, ressenti et douleurs.`,
+    'Écris en français simple, en tutoyant, sans jargon (pas de "Z2", "CTL", "TSB"). Chaque rubrique : 2 à 5 phrases ou une courte liste avec des tirets.',
+    'Si le coureur signale une douleur, dis clairement quoi surveiller et quand lever le pied.',
+    'Réponds UNIQUEMENT par un objet JSON : {"positif": "ce qui a bien marché", "negatif": "ce qui a moins bien marché", "aprevoir": "à prévoir pour la semaine suivante"}',
+    '',
+    '## Séances prévues', JSON.stringify(events.map((e) => pick(e, ['start_date_local', 'name', 'description', 'moving_time', 'distance']))),
+    '## Séances faites', JSON.stringify(runs.map((a) => pick(a, ['start_date_local', 'name', 'distance', 'moving_time', 'average_speed', 'average_heartrate',
+      'max_heartrate', 'total_elevation_gain', 'icu_hr_zone_times', 'compliance', 'icu_rpe', 'feel']))),
+    '## Tes avis sur ces séances', JSON.stringify(runs.map((a) => readAnalysis(user, a.id)).filter(Boolean)),
+    '## Ressenti noté par le coureur', readWeek(user, mondayIso).ressenti || '(rien noté)',
+    '## Séances prévues la semaine suivante', JSON.stringify(upcoming.map((e) => pick(e, ['start_date_local', 'name', 'description']))),
+    '## Planning de travail des 14 prochains jours', travail ? JSON.stringify(travail) : 'Non renseigné.',
+    '## Paramètres du coureur (FC en bpm, allure seuil en m/s, zones = plafonds FC Z1..Z7)', JSON.stringify(params),
+    '## Contexte donné par le coureur', readContext(user) || '(vide)',
+    '## Contexte détaillé par rubrique', JSON.stringify(labelledFields(readFields(user))),
+  ].join('\n');
+  const bilan = { ...parseBilan(await askClaude(user, prompt)), date: new Date().toISOString() };
+  writeWeek(user, mondayIso, { bilan });
+  return bilan;
 }
 
 // ---------- connecteur Claude (MCP, Streamable HTTP sans état) ----------
@@ -445,6 +509,7 @@ const TOOLS = [
       required: ['rubrique', 'texte'],
     },
   },
+  { name: 'lire_semaines', description: 'Dernières semaines (la plus récente en premier) : ressenti noté par le coureur (fatigue, douleurs…) et bilan du coach (positif, négatif, à prévoir).', inputSchema: { type: 'object', properties: { nombre: { type: 'integer', minimum: 1, maximum: 52 } } } },
   { name: 'lire_avis_coach', description: 'Derniers avis du coach sur les séances faites (note sur 10, résumé, points forts, à améliorer, conseil pour la suite).', inputSchema: { type: 'object', properties: { nombre: { type: 'integer', minimum: 1, maximum: 50 } } } },
 ];
 
@@ -487,6 +552,7 @@ async function callTool(user, name, args = {}) {
     writeFields(user, fields);
     return { [args.rubrique]: next };
   }
+  if (name === 'lire_semaines') return recentWeeks(user, Math.min(52, Number(args.nombre) || 4));
   if (name === 'lire_avis_coach') return recentAnalyses(user, Math.min(50, Number(args.nombre) || 5));
   throw new Error(`Outil inconnu : ${name}`);
 }
@@ -631,7 +697,7 @@ async function signup(f) {
   return { user };
 }
 
-async function weekPage(user, offset = 0) {
+async function weekPage(user, offset = 0, error) {
   const ref = new Date();
   ref.setDate(ref.getDate() + 7 * offset);
   const { monday, sunday } = weekBounds(ref);
@@ -668,6 +734,22 @@ ${ev ? `<span class="muted">${esc(planSummary(ev.description))}</span>` : ''}
   }).join('\n');
 
   const pct = plannedKm ? Math.min(100, Math.round((100 * doneKm) / plannedKm)) : 0;
+  const mon = isoDay(monday);
+  const wk = readWeek(user, mon);
+  const b = wk.bilan;
+  const action = `/semaine/${mon}`;
+  const bilanHtml = mon > today ? '' : `<section class="card" aria-label="Bilan de la semaine"><h2 style="margin:0">Bilan de la semaine</h2>
+${error ? `<p class="err" role="alert">${esc(error)}</p>` : ''}
+<form method="post" action="${action}/ressenti" style="display:flex;flex-direction:column;gap:8px"><input type="hidden" name="w" value="${offset}">
+<label for="ressenti">Mon ressenti : fatigue, douleurs, sommeil, moral…</label>
+<textarea id="ressenti" name="ressenti" rows="4" maxlength="5000">${esc(wk.ressenti)}</textarea>
+<button class="btn ghost" type="submit">Enregistrer mon ressenti</button></form>
+${b ? `<div><span class="k" style="color:#1D7A46">POSITIF</span><p style="white-space:pre-line">${esc(b.positif)}</p></div>
+<div><span class="k" style="color:#B4232C">NÉGATIF</span><p style="white-space:pre-line">${esc(b.negatif)}</p></div>
+<div><span class="k" style="color:#1E4FA8">À PRÉVOIR</span><p style="white-space:pre-line">${esc(b.aprevoir)}</p></div>
+<span class="muted" style="font-size:12px">Bilan par Claude · ${new Date(b.date).toLocaleDateString('fr-FR')}</span>` : ''}
+${isoDay(sunday) <= today ? `<form method="post" action="${action}/bilan"><input type="hidden" name="w" value="${offset}"><button class="btn${b ? ' ghost' : ''}" type="submit" style="width:100%">${b ? 'Refaire le bilan' : 'Demander le bilan de la semaine'}</button></form>
+${b ? '' : '<p class="muted">Claude relit tes séances, ses avis et ton ressenti. Ça prend environ une minute.</p>'}` : '<p class="muted">Le bilan du coach sera disponible dimanche.</p>'}</section>`;
   return page('Ma semaine', `<div><div class="row">${weekLink(offset - 1, 'Semaine précédente', '‹')}<p class="muted">Semaine du ${dayLabel(isoDay(monday), { day: 'numeric', month: 'short' })} au ${dayLabel(isoDay(sunday), { day: 'numeric', month: 'short' })}</p>${weekLink(offset + 1, 'Semaine suivante', '›')}</div>
 <h1>Salut ${esc(user.name)}</h1>${offset ? `<a class="muted" href="/semaine">Revenir à cette semaine</a>` : ''}</div>
 ${offset ? '' : `<${todayCard ? `a href="/prevu/${encodeURIComponent(todayCard.ev.id)}"` : 'div'} class="today" style="display:block"><b>AUJOURD'HUI</b><span class="title">${todayCard ? esc(cleanTitle(todayCard.ev.name)) : 'Repos'}</span>
@@ -678,7 +760,8 @@ ${todayCard ? `<p class="muted">${esc(planSummary(todayCard.ev.description))}</p
 ${plannedKm ? `<div class="bar" aria-hidden="true"><i style="width:${pct}%"></i></div>` : ''}
 <div class="grid3"><div><div class="v">${duration(time)}</div><span class="muted">de course</span></div>
 <div><div class="v">${avg}${notes.length ? '/10' : ''}</div><span class="muted">score moyen</span></div>
-<div><div class="v">${done}/${planned.length}</div><span class="muted">séances faites</span></div></div></section>`, 'semaine');
+<div><div class="v">${done}/${planned.length}</div><span class="muted">séances faites</span></div></div></section>
+${bilanHtml}`, 'semaine');
 }
 
 async function sessionPage(user, actId, error) {
@@ -937,7 +1020,31 @@ async function handle(req, res) {
   if (!user) return redirect(res, '/login');
 
   if (p === '/logout' && req.method === 'POST') return redirect(res, '/login', { 'Set-Cookie': 'session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0' });
-  if (p === '/' || p === '/semaine') return send(res, 200, await weekPage(user, Math.max(-52, Math.min(52, parseInt(url.searchParams.get('w'), 10) || 0))));
+  const weekOffset = (v) => Math.max(-52, Math.min(52, parseInt(v, 10) || 0));
+  if (p === '/' || p === '/semaine') return send(res, 200, await weekPage(user, weekOffset(url.searchParams.get('w'))));
+  const wm = /^\/semaine\/(\d{4}-\d{2}-\d{2})\/(ressenti|bilan)$/.exec(p);
+  if (wm && req.method === 'POST') {
+    const f = await readForm(req);
+    const w = weekOffset(f.get('w'));
+    const back = `/semaine${w ? `?w=${w}` : ''}`;
+    if (wm[2] === 'ressenti') {
+      writeWeek(user, wm[1], { ressenti: String(f.get('ressenti') || '').trim().slice(0, 5000) });
+      return redirect(res, back);
+    }
+    const key = `${user.id}/bilan/${wm[1]}`;
+    if (!running.has(key)) {
+      running.add(key);
+      try {
+        await weekBilan(user, wm[1]);
+      } catch (err) {
+        console.error('bilan', key, err);
+        return send(res, 500, await weekPage(user, w, "Le coach n'a pas pu faire le bilan. Réessaie dans un moment."));
+      } finally {
+        running.delete(key);
+      }
+    }
+    return redirect(res, back);
+  }
   if (p === '/profil' && req.method === 'GET') return send(res, 200, await profilePage(user, url.searchParams.has('ok') ? 'Enregistré.' : ''));
   if (p === '/profil' && req.method === 'POST') {
     const f = await readForm(req);
@@ -1015,4 +1122,4 @@ if (require.main === module) {
   })).listen(PORT, () => console.log(`App running sur http://localhost:${PORT}`));
 }
 
-module.exports = { mcpRpc, parseIcs, parseIcsUrl, kmSplits, paceChart, weeklyTotals, weekStreak, mergeParams, parsePace, zoneRange, stepLines, nextHistory, parseParams, hashPassword, checkPassword, sign, unsign, weekBounds, cleanTitle, planSummary, effortSplit, matchWeek, parseAnalysis, isoDay };
+module.exports = { mcpRpc, parseIcs, parseIcsUrl, kmSplits, paceChart, weeklyTotals, weekStreak, mergeParams, parsePace, zoneRange, stepLines, nextHistory, parseParams, hashPassword, checkPassword, sign, unsign, weekBounds, cleanTitle, planSummary, effortSplit, matchWeek, parseAnalysis, parseBilan, isoDay };
