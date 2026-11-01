@@ -6,6 +6,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const { execFile } = require('node:child_process');
+const { IMG, ROUTINES, routineOf } = require('./muscu');
 
 const PORT = Number(process.env.PORT) || 3000;
 const USERS_FILE = process.env.USERS_FILE || path.join(__dirname, 'users.json');
@@ -631,13 +632,31 @@ const icon = (k) => `<svg aria-hidden="true" width="24" height="24" viewBox="0 0
 function nav(current) {
   const link = (k, href, label) => `<a href="${href}"${current === k ? ' aria-current="page"' : ''}>${icon(k)}${label}</a>`;
   const soon = (k, label) => `<span aria-disabled="true" title="Bientôt">${icon(k)}${label}</span>`;
-  return `<nav aria-label="Navigation">${link('semaine', '/semaine', 'Semaine')}${link('progres', '/progres', 'Progrès')}${soon('nutrition', 'Nutrition')}${soon('muscu', 'Muscu')}${link('profil', '/profil', 'Profil')}</nav>`;
+  return `<nav aria-label="Navigation">${link('semaine', '/semaine', 'Semaine')}${link('progres', '/progres', 'Progrès')}${soon('nutrition', 'Nutrition')}${link('muscu', '/muscu', 'Muscu')}${link('profil', '/profil', 'Profil')}</nav>`;
 }
 
 const page = (title, body, current, head = '') => `<!doctype html><html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title>
 <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>${CSS}</style>${head}</head><body><main>${body}</main>${current ? nav(current) : ''}</body></html>`;
+
+const shot = (id, alt) => (id ? `<div class="grid2" style="gap:8px">${[0, 1].map((n) => `<img src="${IMG}${id}/${n}.jpg" alt="${esc(alt)} : ${n ? 'arrivée' : 'départ'}" loading="lazy" style="width:100%;border-radius:12px">`).join('')}</div>` : '');
+const ul = (items) => `<ul style="margin:0;padding-left:20px">${items.map((t) => `<li>${esc(t)}</li>`).join('')}</ul>`;
+
+function muscuPage() {
+  return page('Muscu', `<h1>Muscu</h1><p class="muted">Touche un exercice pour voir comment le faire. Chaque exercice a une version salle et une version maison (poids du corps ou élastique).</p>
+${ROUTINES.map((r) => `<section id="${r.id}" class="card" aria-label="${esc(r.nom)}"><div class="row"><h2 style="margin:0">${esc(r.nom)}</h2><span class="chip">${r.duree}</span></div>
+<p class="muted">${esc(r.intro)}</p><p style="font-size:14px"><b>Échauffement</b> : ${esc(r.echauffement)}</p>
+${r.exercices.map((e) => `<details id="${r.id}-${e.id}" style="border-top:1px solid #ECE9E3;padding-top:10px"><summary style="min-height:44px;cursor:pointer;font-weight:700">${esc(e.nom)} <span class="muted" style="font-weight:400">· ${esc(e.series)}</span></summary>
+<div style="display:flex;flex-direction:column;gap:10px;padding:8px 0">${shot(e.img, e.nom)}${e.legende ? `<p class="muted">${esc(e.legende)}</p>` : ''}
+<p><b>Salle</b> : ${esc(e.salle)}</p><p><b>Maison</b> : ${esc(e.maison)}</p>${shot(e.imgMaison, `${e.nom}, version maison`)}
+<h3 style="margin:0;font-size:15px">Comment faire</h3><ol style="margin:0;padding-left:20px">${e.comment.map((t) => `<li>${esc(t)}</li>`).join('')}</ol>
+<h3 style="margin:0;font-size:15px">Les points clés</h3>${ul(e.consignes)}
+<h3 style="margin:0;font-size:15px">Erreurs courantes</h3>${ul(e.erreurs)}</div></details>`).join('')}
+<details style="border-top:1px solid #ECE9E3;padding-top:10px"><summary style="min-height:44px;cursor:pointer;font-weight:700">Pas de salle ? La séance ${r.id} à la maison</summary>
+<ol style="margin:0;padding-left:20px">${r.exercices.map((e) => `<li><b>${esc(e.nom)}</b> (${esc(e.series)}) : ${esc(e.maison)}</li>`).join('')}</ol></details></section>`).join('')}
+<p class="muted" style="font-size:12px">Photos : free-exercise-db, domaine public.</p>`, 'muscu');
+}
 
 function loginPage(error) {
   return page('Connexion', `<div style="margin-top:12vh;display:flex;flex-direction:column;gap:8px">
@@ -889,6 +908,7 @@ async function plannedPage(user, eventId) {
 <div style="display:flex;flex-direction:column;gap:6px"><span class="muted">${dayLabel(day, { weekday: 'long', day: 'numeric', month: 'short' })}</span>
 <h1>${esc(cleanTitle(ev.name))}</h1><span class="chip" style="align-self:flex-start">${day < isoDay(new Date()) ? 'Manquée' : 'À venir'}</span></div>
 <p>${esc(planSummary(ev.description))}</p>
+${ev.type === 'WeightTraining' ? `<a class="btn" href="/muscu${routineOf(ev.name) ? `#${routineOf(ev.name)}` : ''}" style="display:flex;align-items:center;justify-content:center">Voir les exercices (salle et maison)</a>` : ''}
 <section class="card grid2" aria-label="En bref" style="display:grid">
 <div><div class="v">${ev.moving_time ? duration(ev.moving_time) : '–'}</div><span class="muted">durée prévue</span></div>
 <div><div class="v">${ev.distance ? `${km(ev.distance)} km` : '–'}</div><span class="muted">distance prévue</span></div></section>
@@ -1074,6 +1094,7 @@ async function handle(req, res) {
     updateUser(user.id, { params });
     return redirect(res, '/profil?ok');
   }
+  if (p === '/muscu') return send(res, 200, muscuPage());
   if (p === '/progres') return send(res, 200, await progressPage(user, url.searchParams.has('s') ? Number(url.searchParams.get('s')) : undefined));
   const pm = /^\/prevu\/(\d+)$/.exec(p);
   if (pm && req.method === 'GET') {
@@ -1122,4 +1143,4 @@ if (require.main === module) {
   })).listen(PORT, () => console.log(`App running sur http://localhost:${PORT}`));
 }
 
-module.exports = { mcpRpc, parseIcs, parseIcsUrl, kmSplits, paceChart, weeklyTotals, weekStreak, mergeParams, parsePace, zoneRange, stepLines, nextHistory, parseParams, hashPassword, checkPassword, sign, unsign, weekBounds, cleanTitle, planSummary, effortSplit, matchWeek, parseAnalysis, parseBilan, isoDay };
+module.exports = { muscuPage, mcpRpc, parseIcs, parseIcsUrl, kmSplits, paceChart, weeklyTotals, weekStreak, mergeParams, parsePace, zoneRange, stepLines, nextHistory, parseParams, hashPassword, checkPassword, sign, unsign, weekBounds, cleanTitle, planSummary, effortSplit, matchWeek, parseAnalysis, parseBilan, isoDay };

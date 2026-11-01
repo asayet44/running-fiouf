@@ -36,6 +36,13 @@ assert.strictEqual(s.parseAnalysis(out).note, 7);
 assert.throws(() => s.parseAnalysis(JSON.stringify({ result: '{"note": 12}' })));
 assert.throws(() => s.parseAnalysis(JSON.stringify({ result: 'pas de json' })));
 
+const m = require('./muscu');
+assert.strictEqual(m.routineOf('S2 - Renfo A (force)'), 'A');
+assert.strictEqual(m.routineOf('S2 - renfo b (genou, hanches)'), 'B');
+assert.strictEqual(m.routineOf('S2 - Footing 8 km'), null);
+for (const r of m.ROUTINES) for (const e of r.exercices) assert.ok(e.maison && e.comment.length && e.erreurs.length, e.id);
+assert.ok(s.muscuPage().includes('id="A-squat"'));
+
 console.log('ok');
 
 // v2 : paramètres, zones, séances prévues, historique
