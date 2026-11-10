@@ -134,3 +134,27 @@ const bilan = s.parseBilan(JSON.stringify({ result: 'Voilà : {"positif": "Régu
 assert.deepStrictEqual(bilan, { positif: 'Régulier', negatif: '', aprevoir: 'Repos lundi' });
 assert.throws(() => s.parseBilan(JSON.stringify({ result: '{}' })));
 console.log('ok bilan');
+
+// Muscu : séance active, suggestions de charge
+assert.deepStrictEqual(m.parseSeries('3 × 5–6 (salle) / 3 × 12 (maison)', 'maison'), { sets: 3, min: 12, max: 12, sec: false });
+assert.deepStrictEqual(m.parseSeries('3 × 5–6 (salle) / 3 × 12 (maison)'), { sets: 3, min: 5, max: 6, sec: false });
+assert.deepStrictEqual(m.parseSeries('2 × 20 s par côté'), { sets: 2, min: 20, max: 20, sec: true });
+assert.deepStrictEqual(m.parseSeries('3 × 15 par jambe'), { sets: 3, min: 15, max: 15, sec: false });
+const t68 = m.parseSeries('3 × 6–8');
+assert.strictEqual(m.suggest(t68, null, 'salle').kg, null);
+assert.strictEqual(m.suggest(t68, { series: [{ reps: 8, kg: 40 }, { reps: 8, kg: 40 }, { reps: 8, kg: 40 }] }, 'salle').kg, 42.5);
+assert.strictEqual(m.suggest(t68, { series: [{ reps: 8, kg: 12 }, { reps: 8, kg: 12 }, { reps: 8, kg: 12 }] }, 'salle').kg, 13);
+assert.deepStrictEqual(m.suggest(t68, { series: [{ reps: 7, kg: 40 }, { reps: 6, kg: 40 }, { reps: 6, kg: 40 }] }, 'salle').reps, 8);
+assert.strictEqual(m.suggest(t68, { series: [{ reps: 6, kg: 40 }, { reps: 5, kg: 40 }] }, 'salle').reps, 6);
+assert.strictEqual(m.suggest(t68, { bande: 1, series: [{ reps: 8 }, { reps: 8 }, { reps: 8 }] }, 'maison').bande, 2);
+assert.strictEqual(m.suggest(t68, { bande: 4, series: [{ reps: 8 }, { reps: 8 }, { reps: 8 }] }, 'maison').reps, 10);
+const sess = [{ lieu: 'maison', exercices: { squat: { bande: 2, series: [{ reps: 12 }] } } }, { lieu: 'salle', exercices: { squat: { series: [{ reps: 5, kg: 60 }] } } }];
+assert.strictEqual(m.lastFor(sess, 'squat', 'salle').series[0].kg, 60);
+assert.strictEqual(m.lastFor(sess, 'rdl', 'salle'), null);
+const rA = m.ROUTINES[0];
+const mform = new URLSearchParams({ 'squat.0.reps': '6', 'squat.0.kg': '42,5', 'squat.1.reps': '', 'squat.3.reps': '5', 'squat.3.kg': '40', 'rdl.0.reps': 'abc', 'squat.bande': '3' });
+assert.deepStrictEqual(s.parseMuscuForm(mform, rA, 'salle'), { squat: { series: [{ reps: 6, kg: 42.5 }, { reps: 5, kg: 40 }] } });
+assert.deepStrictEqual(s.parseMuscuForm(mform, rA, 'maison'), { squat: { bande: 3, series: [{ reps: 6 }, { reps: 5 }] } });
+assert.ok(s.activePage(rA, 'salle', sess).includes('name="squat.2.kg" inputmode="decimal" value="60"'));
+assert.ok(s.muscuPage(sess.map((x) => ({ ...x, date: '2026-11-10', routine: 'A' }))).includes('Mes séances'));
+console.log('ok muscu');

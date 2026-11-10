@@ -128,4 +128,46 @@ const ROUTINES = [
 // « S2 - Renfo A (force) » -> 'A'
 const routineOf = (name) => (/renfo\s+([AB])\b/i.exec(name || '') || [])[1]?.toUpperCase() || null;
 
-module.exports = { IMG, ROUTINES, routineOf };
+// À la maison, la charge est un niveau d'élastique (index dans BANDES).
+const BANDES = ['Poids du corps', 'Élastique léger', 'Élastique moyen', 'Élastique fort', 'Élastique très fort'];
+
+// « 3 × 5–6 (salle) / 3 × 12 (maison) », « 2 × 20 s par côté » -> { sets, min, max, sec }
+function parseSeries(series, lieu = 'salle') {
+  const parts = String(series).split('/');
+  const part = parts.find((x) => x.includes(`(${lieu})`)) || parts[0];
+  const m = /(\d+)\s*×\s*(\d+)(?:\s*[–-]\s*(\d+))?\s*(s\b)?/.exec(part);
+  if (!m) return { sets: 3, min: 8, max: 12, sec: false };
+  return { sets: +m[1], min: +m[2], max: +(m[3] || m[2]), sec: !!m[4] };
+}
+
+// Double progression : toutes les séries au haut de la fourchette -> on monte la charge ; sinon même charge, une rep de plus.
+// last = { bande?, series: [{ reps, kg? }] } (dernière fois au même endroit). Renvoie { kg, bande, reps, text }.
+function suggest(t, last, lieu) {
+  const unit = t.sec ? ' s' : ' reps';
+  if (!last?.series?.length) {
+    return { kg: null, bande: 0, reps: t.max, text: t.sec ? 'Première fois : tiens le temps prévu sans perdre la position.' : 'Première fois : prends une charge qui te laisse 2–3 reps en réserve.' };
+  }
+  const kg = Math.max(0, ...last.series.map((x) => x.kg || 0)) || null;
+  const bande = last.bande || 0;
+  const top = last.series.length >= t.sets && last.series.every((x) => x.reps >= t.max);
+  const miss = last.series.some((x) => x.reps < t.min);
+  const best = Math.max(...last.series.map((x) => x.reps));
+  const charge = lieu === 'maison' ? BANDES[bande].toLowerCase() : kg ? `${String(kg).replace('.', ',')} kg` : 'poids du corps';
+  if (top) {
+    if (t.sec) return { kg, bande, reps: t.max + 5, text: `Tenu ${t.max} s partout : passe à ${t.max + 5} s.` };
+    if (lieu === 'maison' && bande < BANDES.length - 1) return { kg, bande: bande + 1, reps: t.min, text: `Toutes les séries à ${t.max} reps : passe à ${BANDES[bande + 1].toLowerCase()}, vise ${t.min} reps.` };
+    if (lieu === 'salle' && kg) {
+      const next = Math.round((kg + (kg >= 20 ? 2.5 : 1)) * 10) / 10;
+      return { kg: next, bande, reps: t.min, text: `Toutes les séries à ${t.max} reps : passe à ${String(next).replace('.', ',')} kg, vise ${t.min} reps.` };
+    }
+    return { kg, bande, reps: t.max + 2, text: `Toutes les séries à ${t.max} reps : ajoute 2 reps ou descends plus lentement (4 s).` };
+  }
+  if (miss) return { kg, bande, reps: t.min, text: `Pas toutes les ${t.min}${unit} la dernière fois : garde ${charge} et vise ${t.min}${unit}.` };
+  const reps = Math.min(t.max, best + (t.sec ? 5 : 1));
+  return { kg, bande, reps, text: `Garde ${charge}, vise ${reps}${unit} par série.` };
+}
+
+// Séances triées de la plus récente à la plus ancienne -> dernier passage de l'exercice au même endroit.
+const lastFor = (sessions, exId, lieu) => sessions.find((x) => x.lieu === lieu && x.exercices?.[exId]?.series?.length)?.exercices[exId] || null;
+
+module.exports = { IMG, ROUTINES, BANDES, routineOf, parseSeries, suggest, lastFor };
