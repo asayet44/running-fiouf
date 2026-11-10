@@ -6,7 +6,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const { execFile } = require('node:child_process');
-const { IMG, ROUTINES, routineOf } = require('./muscu');
+const { IMG, ROUTINES, BANDES, routineOf, parseSeries, suggest, lastFor } = require('./muscu');
 
 const PORT = Number(process.env.PORT) || 3000;
 const USERS_FILE = process.env.USERS_FILE || path.join(__dirname, 'users.json');
@@ -306,6 +306,37 @@ function recentWeeks(user, n = 4) {
   if (!fs.existsSync(dir)) return [];
   return fs.readdirSync(dir).filter((f) => f.endsWith('.json')).sort().reverse().slice(0, n)
     .map((f) => ({ semaine_du: f.slice(0, 10), ...readWeek(user, f.slice(0, 10)) }));
+}
+
+// Une séance de muscu = DATA_DIR/<id>/muscu/<horodatage>.json : { date, routine, lieu, exercices: { <id>: { bande?, series: [{ reps, kg? }] } } }
+const muscuDir = (user) => path.join(DATA_DIR, user.id, 'muscu');
+function readMuscu(user, n = 60) {
+  const dir = muscuDir(user);
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir).filter((f) => f.endsWith('.json')).sort().reverse().slice(0, n)
+    .map((f) => { try { return JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')); } catch { return null; } }).filter(Boolean);
+}
+function saveMuscu(user, session) {
+  fs.mkdirSync(muscuDir(user), { recursive: true });
+  fs.writeFileSync(path.join(muscuDir(user), `${new Date().toISOString().replace(/[:.]/g, '-')}.json`), JSON.stringify(session, null, 2));
+}
+
+// Formulaire de la séance active -> exercices saisis ; une série sans reps n'a pas été faite.
+function parseMuscuForm(f, routine, lieu) {
+  const num = (v, max) => { const x = parseFloat(String(v ?? '').replace(',', '.')); return Number.isFinite(x) && x >= 0 && x <= max ? x : null; };
+  const exercices = {};
+  for (const e of routine.exercices) {
+    const series = [];
+    for (let i = 0; i < 10; i++) {
+      const reps = num(f.get(`${e.id}.${i}.reps`), 999);
+      if (reps == null || reps === 0) continue;
+      const kg = lieu === 'salle' ? num(f.get(`${e.id}.${i}.kg`), 500) : null;
+      series.push(kg ? { reps: Math.round(reps), kg } : { reps: Math.round(reps) });
+    }
+    if (!series.length) continue;
+    exercices[e.id] = lieu === 'maison' ? { bande: Math.min(BANDES.length - 1, Math.round(num(f.get(`${e.id}.bande`), 9) || 0)), series } : { series };
+  }
+  return exercices;
 }
 
 const HISTORY_FILE = 'parametres.json';
@@ -643,9 +674,21 @@ const page = (title, body, current, head = '') => `<!doctype html><html lang="fr
 const shot = (id, alt) => (id ? `<div class="grid2" style="gap:8px">${[0, 1].map((n) => `<img src="${IMG}${id}/${n}.jpg" alt="${esc(alt)} : ${n ? 'arrivée' : 'départ'}" loading="lazy" style="width:100%;border-radius:12px">`).join('')}</div>` : '');
 const ul = (items) => `<ul style="margin:0;padding-left:20px">${items.map((t) => `<li>${esc(t)}</li>`).join('')}</ul>`;
 
-function muscuPage() {
-  return page('Muscu', `<h1>Muscu</h1><p class="muted">Touche un exercice pour voir comment le faire. Chaque exercice a une version salle et une version maison (poids du corps ou élastique).</p>
+const fmtKg = (kg) => String(kg).replace('.', ',');
+const fmtSets = (ex, lieu) => `${lieu === 'maison' ? `${BANDES[ex.bande || 0]} : ` : ''}${ex.series.map((x) => (x.kg ? `${x.reps}×${fmtKg(x.kg)} kg` : x.reps)).join(', ')}`;
+
+function muscuHistory(sessions) {
+  if (!sessions.length) return '';
+  const name = (r, id) => ROUTINES.find((x) => x.id === r)?.exercices.find((e) => e.id === id)?.nom || id;
+  return `<section id="historique" class="card" aria-label="Mes séances"><h2 style="margin:0">Mes séances</h2>
+${sessions.slice(0, 10).map((x) => `<details style="border-top:1px solid #ECE9E3;padding-top:10px"><summary style="min-height:44px;cursor:pointer;font-weight:700">${esc(dayLabel(x.date, { weekday: 'short', day: 'numeric', month: 'short' }))} · Séance ${esc(x.routine)} <span class="muted" style="font-weight:400">· ${x.lieu === 'maison' ? 'maison' : 'salle'}</span></summary>
+${ul(Object.entries(x.exercices).map(([id, ex]) => `${name(x.routine, id)} : ${fmtSets(ex, x.lieu)}`))}</details>`).join('')}</section>`;
+}
+
+function muscuPage(sessions = [], msg = '') {
+  return page('Muscu', `<h1>Muscu</h1>${msg ? `<p class="today">${esc(msg)}</p>` : ''}<p class="muted">Lance une séance pour noter tes reps et tes charges : l'app te propose la charge suivante d'après tes séances. Touche un exercice pour voir comment le faire.</p>
 ${ROUTINES.map((r) => `<section id="${r.id}" class="card" aria-label="${esc(r.nom)}"><div class="row"><h2 style="margin:0">${esc(r.nom)}</h2><span class="chip">${r.duree}</span></div>
+<div class="grid2" style="gap:8px"><a class="btn" href="/muscu/seance/${r.id}" style="display:flex;align-items:center;justify-content:center">Démarrer en salle</a><a class="btn ghost" href="/muscu/seance/${r.id}?lieu=maison" style="display:flex;align-items:center;justify-content:center">À la maison</a></div>
 <p class="muted">${esc(r.intro)}</p><p style="font-size:14px"><b>Échauffement</b> : ${esc(r.echauffement)}</p>
 ${r.exercices.map((e) => `<details id="${r.id}-${e.id}" style="border-top:1px solid #ECE9E3;padding-top:10px"><summary style="min-height:44px;cursor:pointer;font-weight:700">${esc(e.nom)} <span class="muted" style="font-weight:400">· ${esc(e.series)}</span></summary>
 <div style="display:flex;flex-direction:column;gap:10px;padding:8px 0">${shot(e.img, e.nom)}${e.legende ? `<p class="muted">${esc(e.legende)}</p>` : ''}
@@ -655,7 +698,39 @@ ${r.exercices.map((e) => `<details id="${r.id}-${e.id}" style="border-top:1px so
 <h3 style="margin:0;font-size:15px">Erreurs courantes</h3>${ul(e.erreurs)}</div></details>`).join('')}
 <details style="border-top:1px solid #ECE9E3;padding-top:10px"><summary style="min-height:44px;cursor:pointer;font-weight:700">Pas de salle ? La séance ${r.id} à la maison</summary>
 <ol style="margin:0;padding-left:20px">${r.exercices.map((e) => `<li><b>${esc(e.nom)}</b> (${esc(e.series)}) : ${esc(e.maison)}</li>`).join('')}</ol></details></section>`).join('')}
+${muscuHistory(sessions)}
 <p class="muted" style="font-size:12px">Photos : free-exercise-db, domaine public.</p>`, 'muscu');
+}
+
+// Séance active : une ligne par série (reps, kg en salle ; niveau d'élastique à la maison), charge proposée d'après la dernière fois.
+function activePage(routine, lieu, sessions, error) {
+  const maison = lieu === 'maison';
+  const field = (name, value, label, ph = '') => `<label style="display:flex;flex-direction:column;gap:2px;font-size:12px;font-weight:600;color:#55585F">${label}<input name="${name}" inputmode="decimal" ${value != null ? `value="${esc(value)}"` : ''} placeholder="${esc(ph)}" style="padding:10px;min-height:44px"></label>`;
+  const blocks = routine.exercices.map((e) => {
+    const t = parseSeries(e.series, lieu);
+    const last = lastFor(sessions, e.id, lieu);
+    const s = suggest(t, last, lieu);
+    const rows = Array.from({ length: t.sets }, (_, i) => `<div style="display:grid;grid-template-columns:${maison ? '40px 1fr' : '40px 1fr 1fr'};gap:8px;align-items:end"><span class="muted" style="padding-bottom:12px">S${i + 1}</span>
+${field(`${e.id}.${i}.reps`, null, t.sec ? 'secondes' : 'reps', String(s.reps))}${maison ? '' : field(`${e.id}.${i}.kg`, s.kg, 'kg', 'poids du corps')}</div>`).join('');
+    return `<section class="card" aria-label="${esc(e.nom)}"><div class="row"><h2 style="margin:0;font-size:17px">${esc(e.nom)}</h2><a class="muted" href="/muscu#${routine.id}-${e.id}" style="min-height:44px;display:flex;align-items:center">Fiche</a></div>
+<p class="muted">${esc(e.series)} · ${esc(e[lieu])}</p>
+${last ? `<p style="font-size:14px"><b>Dernière fois</b> : ${esc(fmtSets(last, lieu))}</p>` : ''}<p class="today" style="font-size:14px;padding:10px 14px">${esc(s.text)}</p>
+${maison ? `<label style="display:flex;flex-direction:column;gap:4px">Résistance<select name="${e.id}.bande" style="width:100%;border:1px solid #DAD6CE;border-radius:14px;padding:12px;font:16px Manrope,system-ui,sans-serif;background:#fff">${BANDES.map((b, i) => `<option value="${i}"${i === s.bande ? ' selected' : ''}>${b}</option>`).join('')}</select></label>` : ''}
+${rows}${t.sets < 10 ? `<button type="button" class="link" style="color:#C2410C;align-self:flex-start" data-add="${e.id}">+ une série</button>` : ''}</section>`;
+  }).join('');
+  return page(`Séance ${routine.id}`, `<a href="/muscu" class="muted" style="min-height:44px;display:flex;align-items:center">‹ Muscu</a>
+<h1>${esc(routine.nom)}</h1><div class="grid2" style="gap:8px"><a class="btn${maison ? ' ghost' : ''}" href="/muscu/seance/${routine.id}" style="display:flex;align-items:center;justify-content:center">Salle</a><a class="btn${maison ? '' : ' ghost'}" href="/muscu/seance/${routine.id}?lieu=maison" style="display:flex;align-items:center;justify-content:center">Maison</a></div>
+${error ? `<p class="err">${esc(error)}</p>` : ''}<p class="muted">Note chaque série une fois faite (le chiffre grisé est l'objectif). Une série laissée vide compte comme non faite. Échauffement : ${esc(routine.echauffement)}</p>
+<form id="seance" method="post" action="/muscu/seance/${routine.id}?lieu=${lieu}" style="display:flex;flex-direction:column;gap:18px">${blocks}
+<button class="btn" type="submit">Terminer la séance</button></form><div style="height:60px" aria-hidden="true"></div>
+<div style="position:fixed;left:0;right:0;bottom:84px;display:flex;justify-content:center;gap:8px;pointer-events:none"><button type="button" class="btn ghost" data-rest="60" style="pointer-events:auto;background:#fff;min-height:44px;font-size:14px;padding:0 14px;box-shadow:0 2px 8px rgba(23,24,27,.12)">Repos 1:00</button><button type="button" class="btn ghost" data-rest="120" style="pointer-events:auto;background:#fff;min-height:44px;font-size:14px;padding:0 14px;box-shadow:0 2px 8px rgba(23,24,27,.12)">Repos 2:00</button><style>#chrono:empty{display:none}</style><span id="chrono" role="timer" aria-live="polite" class="chip" style="align-self:center;font-size:16px"></span></div>
+<script>(function(){var f=document.getElementById('seance'),k='muscu:'+location.pathname+location.search,today=new Date().toDateString();
+try{var d=JSON.parse(localStorage.getItem(k)||'null');if(d&&d.day===today)for(var n in d.v){if(!f.elements[n])addSet(n.split('.')[0]);if(f.elements[n])f.elements[n].value=d.v[n];}}catch(e){}
+function save(){try{localStorage.setItem(k,JSON.stringify({day:today,v:Object.fromEntries(new FormData(f))}))}catch(e){}}
+function addSet(id){var rows=f.querySelectorAll('[name^="'+id+'."][name$=".reps"]'),last=rows[rows.length-1].closest('div[style*="grid"]'),i=rows.length;if(i>=10)return;var c=last.cloneNode(true);c.querySelector('span').textContent='S'+(i+1);c.querySelectorAll('input').forEach(function(x){x.name=x.name.replace(/\\.\\d+\\./,'.'+i+'.');if(/reps$/.test(x.name))x.value='';});last.after(c);}
+f.addEventListener('input',save);f.addEventListener('submit',function(){try{localStorage.removeItem(k)}catch(e){}});
+f.addEventListener('click',function(e){var id=e.target.dataset&&e.target.dataset.add;if(id){addSet(id);save();}});
+var t,c=document.getElementById('chrono');document.querySelectorAll('[data-rest]').forEach(function(b){b.onclick=function(){var end=Date.now()+b.dataset.rest*1000;clearInterval(t);t=setInterval(function(){var s=Math.max(0,Math.round((end-Date.now())/1000));c.textContent=Math.floor(s/60)+':'+String(s%60).padStart(2,'0');if(!s){clearInterval(t);c.textContent='Go !';if(navigator.vibrate)navigator.vibrate([300,100,300]);}},250);};});})();</script>`, 'muscu');
 }
 
 function loginPage(error) {
@@ -908,7 +983,7 @@ async function plannedPage(user, eventId) {
 <div style="display:flex;flex-direction:column;gap:6px"><span class="muted">${dayLabel(day, { weekday: 'long', day: 'numeric', month: 'short' })}</span>
 <h1>${esc(cleanTitle(ev.name))}</h1><span class="chip" style="align-self:flex-start">${day < isoDay(new Date()) ? 'Manquée' : 'À venir'}</span></div>
 <p>${esc(planSummary(ev.description))}</p>
-${ev.type === 'WeightTraining' ? `<a class="btn" href="/muscu${routineOf(ev.name) ? `#${routineOf(ev.name)}` : ''}" style="display:flex;align-items:center;justify-content:center">Voir les exercices (salle et maison)</a>` : ''}
+${ev.type === 'WeightTraining' ? `<a class="btn" href="/muscu${routineOf(ev.name) ? `/seance/${routineOf(ev.name)}` : ''}" style="display:flex;align-items:center;justify-content:center">${routineOf(ev.name) ? 'Démarrer la séance' : 'Voir les exercices (salle et maison)'}</a>${routineOf(ev.name) ? `<a class="btn ghost" href="/muscu/seance/${routineOf(ev.name)}?lieu=maison" style="display:flex;align-items:center;justify-content:center">Démarrer à la maison (élastique)</a>` : ''}` : ''}
 <section class="card grid2" aria-label="En bref" style="display:grid">
 <div><div class="v">${ev.moving_time ? duration(ev.moving_time) : '–'}</div><span class="muted">durée prévue</span></div>
 <div><div class="v">${ev.distance ? `${km(ev.distance)} km` : '–'}</div><span class="muted">distance prévue</span></div></section>
@@ -1094,7 +1169,19 @@ async function handle(req, res) {
     updateUser(user.id, { params });
     return redirect(res, '/profil?ok');
   }
-  if (p === '/muscu') return send(res, 200, muscuPage());
+  if (p === '/muscu') return send(res, 200, muscuPage(readMuscu(user), url.searchParams.has('ok') ? 'Séance enregistrée. Bravo !' : ''));
+  const sm = /^\/muscu\/seance\/([AB])$/.exec(p);
+  if (sm) {
+    const routine = ROUTINES.find((r) => r.id === sm[1]);
+    const lieu = url.searchParams.get('lieu') === 'maison' ? 'maison' : 'salle';
+    if (req.method === 'GET') return send(res, 200, activePage(routine, lieu, readMuscu(user)));
+    if (req.method === 'POST') {
+      const exercices = parseMuscuForm(await readForm(req), routine, lieu);
+      if (!Object.keys(exercices).length) return send(res, 400, activePage(routine, lieu, readMuscu(user), 'Aucune série notée : remplis au moins une série avant de terminer.'));
+      saveMuscu(user, { date: isoDay(new Date()), routine: routine.id, lieu, exercices });
+      return redirect(res, '/muscu?ok#historique');
+    }
+  }
   if (p === '/progres') return send(res, 200, await progressPage(user, url.searchParams.has('s') ? Number(url.searchParams.get('s')) : undefined));
   const pm = /^\/prevu\/(\d+)$/.exec(p);
   if (pm && req.method === 'GET') {
@@ -1143,4 +1230,4 @@ if (require.main === module) {
   })).listen(PORT, () => console.log(`App running sur http://localhost:${PORT}`));
 }
 
-module.exports = { muscuPage, mcpRpc, parseIcs, parseIcsUrl, kmSplits, paceChart, weeklyTotals, weekStreak, mergeParams, parsePace, zoneRange, stepLines, nextHistory, parseParams, hashPassword, checkPassword, sign, unsign, weekBounds, cleanTitle, planSummary, effortSplit, matchWeek, parseAnalysis, parseBilan, isoDay };
+module.exports = { muscuPage, activePage, parseMuscuForm, mcpRpc, parseIcs, parseIcsUrl, kmSplits, paceChart, weeklyTotals, weekStreak, mergeParams, parsePace, zoneRange, stepLines, nextHistory, parseParams, hashPassword, checkPassword, sign, unsign, weekBounds, cleanTitle, planSummary, effortSplit, matchWeek, parseAnalysis, parseBilan, isoDay };
